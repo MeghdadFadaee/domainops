@@ -1,0 +1,12 @@
+/.domainops/
+/bin/
+/build/
+/coverage/
+/dist/
+*.log
+*.out
+.DS_Store
+.idea/
+.env
+.env.*
+!.env.example
