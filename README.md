@@ -33,7 +33,7 @@ The default command opens a full-screen Bubble Tea v2 interface. The same engine
 
 ## Build and start
 
-Go 1.26 or newer is required when building from source.
+Go 1.26.5 or newer is required when building from source.
 
 ```bash
 make build
