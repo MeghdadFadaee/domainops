@@ -18,10 +18,14 @@ import (
 	"github.com/go-acme/lego/v5/certcrypto"
 	"github.com/go-acme/lego/v5/certificate"
 	"github.com/go-acme/lego/v5/challenge"
+	"github.com/go-acme/lego/v5/challenge/dns01"
 	"github.com/go-acme/lego/v5/lego"
 )
 
-const maxIssuanceConcurrency = 3
+const (
+	maxIssuanceConcurrency = 3
+	defaultIssuanceTimeout = 10 * time.Minute
+)
 
 type EngineRepository interface {
 	AccountRepository
@@ -49,6 +53,7 @@ type Engine struct {
 	preflights    []PreflightHook
 	writeObserver func(context.Context, string, string) error
 	concurrency   int
+	issueTimeout  time.Duration
 }
 
 type EngineOption func(*Engine)
@@ -83,6 +88,14 @@ func WithIssuanceConcurrency(concurrency int) EngineOption {
 	}
 }
 
+func WithIssuanceTimeout(timeout time.Duration) EngineOption {
+	return func(engine *Engine) {
+		if timeout > 0 {
+			engine.issueTimeout = timeout
+		}
+	}
+}
+
 func WithACMEHTTPClient(client *http.Client, userAgent string) EngineOption {
 	return func(engine *Engine) {
 		engine.accounts.HTTPClient = client
@@ -93,12 +106,13 @@ func WithACMEHTTPClient(client *http.Client, userAgent string) EngineOption {
 
 func NewEngine(repository EngineRepository, secrets SecretStore, solver provider.DNS01Solver, resolve ZoneResolver, options ...EngineOption) *Engine {
 	engine := &Engine{
-		accounts:    &AccountService{Repository: repository, Secrets: secrets},
-		repository:  repository,
-		solver:      solver,
-		resolve:     resolve,
-		factory:     &legoBackendFactory{},
-		concurrency: maxIssuanceConcurrency,
+		accounts:     &AccountService{Repository: repository, Secrets: secrets},
+		repository:   repository,
+		solver:       solver,
+		resolve:      resolve,
+		factory:      &legoBackendFactory{},
+		concurrency:  maxIssuanceConcurrency,
+		issueTimeout: defaultIssuanceTimeout,
 	}
 	for _, option := range options {
 		option(engine)
@@ -109,11 +123,20 @@ func NewEngine(repository EngineRepository, secrets SecretStore, solver provider
 func (e *Engine) Accounts() *AccountService { return e.accounts }
 
 type IssueRequest struct {
-	JobID             string `json:"job_id"`
-	Environment       string `json:"environment"`
-	Plan              Plan   `json:"plan"`
-	ConfirmProduction bool   `json:"confirm_production"`
-	ReplacesCertID    string `json:"-"`
+	JobID             string              `json:"job_id"`
+	Environment       string              `json:"environment"`
+	Plan              Plan                `json:"plan"`
+	ConfirmProduction bool                `json:"confirm_production"`
+	ReplacesCertID    string              `json:"-"`
+	Progress          func(IssueProgress) `json:"-"`
+}
+
+type IssueProgress struct {
+	Stage      string
+	Message    string
+	Domain     string
+	Percent    int
+	WaitingDNS bool
 }
 
 type IssueResult struct {
@@ -136,6 +159,14 @@ func (e *Engine) Issue(ctx context.Context, request IssueRequest) (IssueResult, 
 	if request.Environment == EnvironmentProduction && !request.ConfirmProduction {
 		return IssueResult{}, errors.New("production issuance requires explicit confirmation")
 	}
+	timeout := e.issueTimeout
+	if timeout <= 0 {
+		timeout = defaultIssuanceTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	stage := "preflight"
+	reportIssueProgress(request, IssueProgress{Stage: stage, Message: "Checking zone, credential, DNS, and CAA prerequisites", Percent: 10})
 	for _, preflight := range e.preflights {
 		if err := preflight(ctx, request.Plan); err != nil {
 			return IssueResult{}, fmt.Errorf("certificate preflight: %w", err)
@@ -151,6 +182,15 @@ func (e *Engine) Issue(ctx context.Context, request IssueRequest) (IssueResult, 
 	}
 	dnsProvider := NewJournaledDNSProvider(e.solver, e.repository, e.resolve, request.JobID)
 	dnsProvider.OnWriteObserved = e.writeObserver
+	dnsProvider.OnPresented = func(domainName, fqdn string) {
+		stage = "dns-propagation"
+		reportIssueProgress(request, IssueProgress{
+			Stage: stage, Domain: domainName, Percent: 45, WaitingDNS: true,
+			Message: fmt.Sprintf("DNS challenge published for %s; waiting for authoritative propagation", fqdn),
+		})
+	}
+	stage = "acme-order"
+	reportIssueProgress(request, IssueProgress{Stage: stage, Message: "Creating ACME order", Percent: 20})
 	backend, err := e.factory.New(ctx, account, dnsProvider)
 	if err != nil {
 		return IssueResult{}, fmt.Errorf("create ACME backend: %w", err)
@@ -159,6 +199,7 @@ func (e *Engine) Issue(ctx context.Context, request IssueRequest) (IssueResult, 
 	if err != nil {
 		return IssueResult{}, err
 	}
+	stage = "acme-validation"
 	resource, err := backend.Obtain(ctx, certificate.ObtainRequest{
 		Domains:                        slices.Clone(request.Plan.Identifiers),
 		PrivateKey:                     privateKey,
@@ -170,8 +211,16 @@ func (e *Engine) Issue(ctx context.Context, request IssueRequest) (IssueResult, 
 		AlwaysDeactivateAuthorizations: true,
 	})
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return IssueResult{}, fmt.Errorf("ACME order for %s exceeded the %s safety deadline during %s: %w", request.Plan.Name, timeout, stage, ctx.Err())
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return IssueResult{}, fmt.Errorf("ACME order for %s cancelled during %s: %w", request.Plan.Name, stage, ctx.Err())
+		}
 		return IssueResult{}, fmt.Errorf("obtain certificate for %s: %w", request.Plan.Name, err)
 	}
+	stage = "certificate-validation"
+	reportIssueProgress(request, IssueProgress{Stage: stage, Message: "Certificate issued; validating returned key and chain", Percent: 82})
 	artifact, err := artifactFromResource(resource, privateKey, request.Plan.Identifiers)
 	if err != nil {
 		return IssueResult{}, fmt.Errorf("validate ACME result: %w", err)
@@ -190,6 +239,12 @@ func (e *Engine) Issue(ctx context.Context, request IssueRequest) (IssueResult, 
 		Artifact:      artifact,
 		RenewalWindow: renewalWindow,
 	}, nil
+}
+
+func reportIssueProgress(request IssueRequest, progress IssueProgress) {
+	if request.Progress != nil {
+		request.Progress(progress)
+	}
 }
 
 type BatchResult struct {
@@ -450,7 +505,27 @@ func (f *legoBackendFactory) New(_ context.Context, material AccountMaterial, dn
 		return nil, err
 	}
 	if dnsProvider != nil {
-		if err := client.Challenge.SetDNS01Provider(dnsProvider); err != nil {
+		contextAwarePrecheck := dns01.WrapPreCheck(func(ctx context.Context, _ string, fqdn, value string, check dns01.PreCheckFunc) (bool, error) {
+			if err := ctx.Err(); err != nil {
+				return true, err
+			}
+			checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			ready, err := check(checkCtx, fqdn, value)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return true, ctxErr
+			}
+			return ready, err
+		})
+		// Recursive resolvers can retain a negative _acme-challenge response for
+		// the zone's SOA negative TTL long after Cloudflare is authoritative for
+		// the new TXT value. Gate on every authoritative nameserver instead; the
+		// ACME server still performs its own independent validation afterward.
+		if err := client.Challenge.SetDNS01Provider(
+			dnsProvider,
+			dns01.DisableRecursiveNSsPropagationRequirement(),
+			contextAwarePrecheck,
+		); err != nil {
 			return nil, fmt.Errorf("configure DNS-01 provider: %w", err)
 		}
 	}

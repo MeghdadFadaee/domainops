@@ -173,6 +173,11 @@ func (s *Service) SetHealthCheck(check func(context.Context) error) { s.healthCh
 func (s *Service) SetUnlockHook(hook func(context.Context) error)   { s.unlockHook = hook }
 func (s *Service) SetCertificateService(service *CertificateService) {
 	s.certificateService = service
+	if service != nil {
+		service.JobObserver = func(job domain.Job) {
+			s.publish(Event{Kind: "certificate.progress", Message: job.Message, Value: job})
+		}
+	}
 }
 
 func (s *Service) ResolveCredential(ctx context.Context, credentialID string) (provider.Auth, error) {

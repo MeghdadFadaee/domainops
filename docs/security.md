@@ -24,6 +24,8 @@ Tokens are masked during entry. Headless use accepts a token file or vault-passw
 
 TUI connection removal and zone routing bind confirmation to immutable local IDs rather than filtered row positions or non-unique labels. Removal shows affected routes, uses a bounded long-running verification window, and refuses to remove a credential when any preferred zone lacks a live-readable replacement with recent observed write success. Explicit preference changes live-probe DNS read access and label write authority as unproven until an actual provider mutation succeeds.
 
+Certificate progress is structured and bounded; third-party ACME logs are discarded rather than allowed to corrupt the TUI or JSON output. DNS readiness is verified against all authoritative nameservers, avoiding stale recursive negative caches. ACME orders terminate at an explicit per-order deadline, and operator cancellation retains a separate bounded cleanup context so an already-created TXT record is not abandoned merely because the issuance context ended.
+
 ## ACME safety
 
 - Staging is the default issuance environment.

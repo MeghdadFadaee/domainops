@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"time"
@@ -16,6 +18,7 @@ import (
 	cloudflareprovider "github.com/MeghdadFadaee/domainops/internal/providers/cloudflare"
 	"github.com/MeghdadFadaee/domainops/internal/secrets"
 	sqlitestore "github.com/MeghdadFadaee/domainops/internal/store/sqlite"
+	legolog "github.com/go-acme/lego/v5/log"
 )
 
 type Options struct {
@@ -35,10 +38,25 @@ type Runtime struct {
 }
 
 func Open(ctx context.Context, options Options) (*Runtime, error) {
+	configureACMELogger()
 	paths, err := config.Resolve(options.DataDir)
 	if err != nil {
 		return nil, err
 	}
+
+	// Continue with all local resource initialization only after logging is
+	// isolated from stdout; JSON and alternate-screen output must stay clean.
+	return openRuntime(ctx, options, paths)
+}
+
+func configureACMELogger() {
+	// lego's default logger writes directly to stdout, which corrupts both the
+	// Bubble Tea alternate screen and JSON CLI envelopes. DomainOps exposes
+	// bounded, structured certificate progress through its own job/event model.
+	legolog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func openRuntime(ctx context.Context, options Options, paths config.Paths) (*Runtime, error) {
 	if err := paths.Ensure(); err != nil {
 		return nil, err
 	}

@@ -908,6 +908,92 @@ func TestPreferredCredentialFormFitsMinimumTerminalAndShowsRoutingIdentity(t *te
 	}
 }
 
+func TestCertificateRunRendersBoundedProgressAndCancelsSafely(t *testing.T) {
+	model := New(&fakeBackend{}, Options{})
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 64, Height: 18})
+	ctx, cancel := context.WithCancel(context.Background())
+	model.beginCertificateRun("ISSUING WILDCARD CERTIFICATES", 2, ctx, cancel)
+	now := time.Now().UTC()
+	model.applyBackendEvent(app.Event{Kind: "certificate.progress", Value: domain.Job{
+		ID: "job-1", Kind: "certificate.issue", State: domain.JobWaitingForDNS,
+		Progress: 45, Message: "DNS challenge published for _acme-challenge.example.com.; waiting for authoritative propagation", UpdatedAt: now,
+	}})
+	view := model.View().Content
+	if height := lipgloss.Height(view); height > 18 {
+		t.Fatalf("certificate progress height = %d\n%s", height, view)
+	}
+	for _, expected := range []string{"ISSUING WILDCARD CERTIFICATES", "DNS", "DNS challenge published", "45%", "cancel safely"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("certificate progress does not show %q: %q", expected, view)
+		}
+	}
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'b', Text: "b"})
+	if model.certificateRun.Visible || !strings.Contains(model.View().Content, "progress") {
+		t.Fatalf("backgrounded certificate run = visible:%v view:%q", model.certificateRun.Visible, model.View().Content)
+	}
+	_, quit := model.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
+	if quit != nil || !model.certificateRun.Visible || !strings.Contains(model.toast, "DNS cleanup") {
+		t.Fatalf("active certificate quit guard = cmd:%v visible:%v toast:%q", quit != nil, model.certificateRun.Visible, model.toast)
+	}
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'b', Text: "b"})
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'o', Text: "o"})
+	if !model.certificateRun.Visible {
+		t.Fatal("certificate progress shortcut did not reopen the console")
+	}
+
+	_, command := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
+	if command != nil || !model.certificateRun.CancelRequested {
+		t.Fatalf("cancel state = command:%v requested:%v", command != nil, model.certificateRun.CancelRequested)
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("certificate run context was not cancelled")
+	}
+	if view := model.View().Content; !strings.Contains(view, "CANCELLING SAFELY") || !strings.Contains(view, "cleanup to finish") {
+		t.Fatalf("cancelling progress view = %q", view)
+	}
+}
+
+func TestCertificateRunCompletionKeepsSummaryUntilDismissed(t *testing.T) {
+	model := New(&fakeBackend{}, Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	model.beginCertificateRun("ISSUING WILDCARD CERTIFICATES", 1, ctx, cancel)
+	_, _ = model.Update(operationMsg{message: "Issued 0 certificate(s)", err: errors.New("propagation deadline exceeded"), certificate: true})
+	if model.certificateRun == nil || !model.certificateRun.Done || !strings.Contains(model.View().Content, "propagation deadline exceeded") {
+		t.Fatalf("completion summary = %#v", model.certificateRun)
+	}
+	_, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if model.certificateRun != nil {
+		t.Fatal("completed certificate summary was not dismissed")
+	}
+}
+
+func TestCertificateRunActivityCanScrollWithoutLosingTail(t *testing.T) {
+	model := New(&fakeBackend{}, Options{})
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 76, Height: 18})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	model.beginCertificateRun("ISSUING WILDCARD CERTIFICATES", 1, ctx, cancel)
+	for index := range 10 {
+		model.applyBackendEvent(app.Event{Kind: "certificate.progress", Value: domain.Job{
+			ID: "job", State: domain.JobRunning, Progress: index + 1,
+			Message: fmt.Sprintf("stage-%02d", index), UpdatedAt: time.Now().Add(time.Duration(index) * time.Second),
+		}})
+	}
+	if view := model.View().Content; !strings.Contains(view, "stage-09") {
+		t.Fatalf("activity did not follow newest event: %q", view)
+	}
+	_, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyHome})
+	if view := model.View().Content; !strings.Contains(view, "stage-00") || strings.Contains(view, "stage-09") {
+		t.Fatalf("activity home did not show oldest events: %q", view)
+	}
+	_, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnd})
+	if view := model.View().Content; !strings.Contains(view, "stage-09") {
+		t.Fatalf("activity end did not return to live tail: %q", view)
+	}
+}
+
 func TestPreferredCredentialCancellationAndStaleRouteAreSafe(t *testing.T) {
 	backend := &fakeBackend{}
 	model := New(backend, Options{})

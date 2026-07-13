@@ -47,6 +47,7 @@ type JournaledDNSProvider struct {
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
 	OnWriteObserved    func(context.Context, string, string) error
+	OnPresented        func(domainName, fqdn string)
 
 	mu        sync.Mutex
 	presented map[string]presentedChallenge
@@ -108,6 +109,9 @@ func (p *JournaledDNSProvider) Present(ctx context.Context, domainName, token, k
 		recordID:  recordID,
 	}
 	p.mu.Unlock()
+	if p.OnPresented != nil {
+		p.OnPresented(domainName, info.EffectiveFQDN)
+	}
 	return nil
 }
 
@@ -122,11 +126,16 @@ func (p *JournaledDNSProvider) CleanUp(ctx context.Context, domainName, token, _
 	if !ok {
 		return fmt.Errorf("DNS-01 record for %s is not present in this process", domainName)
 	}
-	if err := p.Solver.CleanupDNS01(ctx, presented.auth, presented.zoneID, presented.recordID); err != nil {
+	// lego calls cleanup with the issuance context, which may already be
+	// cancelled or expired. Give exact-record cleanup its own bounded window so
+	// operator cancellation does not strand a live ACME TXT record.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+	defer cancel()
+	if err := p.Solver.CleanupDNS01(cleanupCtx, presented.auth, presented.zoneID, presented.recordID); err != nil {
 		return fmt.Errorf("delete DNS-01 record %s: %w", presented.recordID, err)
 	}
 	cleanedAt := time.Now().UTC()
-	if err := p.Repository.MarkChallengeCleaned(ctx, presented.journalID, cleanedAt); err != nil {
+	if err := p.Repository.MarkChallengeCleaned(cleanupCtx, presented.journalID, cleanedAt); err != nil {
 		return fmt.Errorf("mark DNS-01 challenge %s cleaned: %w", presented.journalID, err)
 	}
 	p.mu.Lock()

@@ -83,12 +83,17 @@ Cloudflare’s token-verification response does not disclose effective write sco
 | `p` | Live-verify and set the selected zone’s preferred connection |
 | `n`, `e`, `d` | Create, edit, or delete a DNS record |
 | `n`, `u`, `i`, `x`, `d` | Issue, renew due, import, export, or revoke a certificate in the Certificates view |
+| `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Inspect the bounded activity history during certificate issuance or renewal |
+| `b` / `o` | Background the certificate progress console or reopen it while navigating |
+| `c` or `Esc` | Cancel an active certificate batch and wait for exact DNS challenge cleanup |
 | `m`, `h`, `t`, `v` | Adjust the TLS mode, HTTPS, TLS 1.3, or minimum TLS version |
 | `s` | Review and apply the Cloudflare TLS diff |
 | `?` | Contextual help |
 | `q` | Quit and restore the terminal |
 
 Long-running synchronization, certificate, and public endpoint jobs run outside the render loop. The TUI remains navigable while they work.
+
+Certificate issuance and renewal use a dedicated progress console rather than writing ACME library logs to the terminal. It shows per-zone stages, DNS propagation waits, elapsed/deadline timing, completed and failed counts, and a scrollable 500-event activity history. Every individual ACME order has a ten-minute safety deadline; cancellation gives exact-record DNS cleanup a separate bounded window before the operation finishes.
 
 ## Certificate issuance
 
@@ -128,6 +133,8 @@ domainops cert issue \
 Production issuance always requires explicit confirmation. A large selection creates independent certificates rather than one coupled SAN certificate.
 
 Each order first verifies the active zone, exact preferred DNS credential, and nested challenge routing, then checks read-probed DNS-access and cached CAA signals. Cloudflare enforces write permission when the challenge is created, and Let’s Encrypt performs the authoritative live DNS and CAA checks.
+
+DomainOps waits for the challenge value on Cloudflare’s authoritative nameservers. It intentionally does not require the machine’s recursive resolver to refresh first: recursive resolvers can retain an earlier NXDOMAIN for the SOA negative-cache period even after the authoritative TXT record exists. The CA still performs its own independent DNS validation.
 
 Renew only certificates inside their stored renewal window:
 

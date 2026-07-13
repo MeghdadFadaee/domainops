@@ -22,12 +22,13 @@ import (
 )
 
 type CertificateService struct {
-	Repository store.Repository
-	Secrets    store.SecretStore
-	Engine     *certificates.Engine
-	Lifecycle  *certificates.Lifecycle
-	ExportRoot string
-	Now        func() time.Time
+	Repository  store.Repository
+	Secrets     store.SecretStore
+	Engine      *certificates.Engine
+	Lifecycle   *certificates.Lifecycle
+	ExportRoot  string
+	Now         func() time.Time
+	JobObserver func(domain.Job)
 }
 
 type IssueZonesRequest struct {
@@ -143,7 +144,7 @@ func (s *CertificateService) IssueZones(ctx context.Context, request IssueZonesR
 		now := s.now().UTC()
 		payload, _ := json.Marshal(map[string]any{"environment": request.Environment, "plan": plan})
 		job := domain.Job{ID: identifier.New("job"), Kind: "certificate.issue", State: domain.JobRunning, ResourceID: zone.ID, Progress: 5, Message: "Preparing ACME order for " + zone.Name, Payload: payload, CreatedAt: now, StartedAt: &now, UpdatedAt: now}
-		if err := s.Repository.SaveJob(ctx, job); err != nil {
+		if err := s.saveJob(ctx, job); err != nil {
 			return IssueZonesResult{}, err
 		}
 		items = append(items, workItem{zone: zone, plan: plan, job: job})
@@ -165,13 +166,27 @@ func (s *CertificateService) IssueZones(ctx context.Context, request IssueZonesR
 			issued, issueErr := s.Engine.Issue(groupCtx, certificates.IssueRequest{
 				JobID: item.job.ID, Environment: request.Environment, Plan: item.plan,
 				ConfirmProduction: request.ConfirmProduction,
+				Progress: func(progress certificates.IssueProgress) {
+					job.Progress = progress.Percent
+					job.Message = item.zone.Name + " · " + progress.Message
+					job.UpdatedAt = s.now().UTC()
+					if progress.WaitingDNS {
+						job.State = domain.JobWaitingForDNS
+					} else {
+						job.State = domain.JobRunning
+					}
+					_ = s.saveJob(groupCtx, job)
+				},
 			})
 			finished := s.now().UTC()
 			if issueErr != nil {
 				job.State, job.Progress = domain.JobFailed, 100
 				job.Message, job.Error = "Certificate issuance failed", issueErr.Error()
+				if errors.Is(issueErr, context.Canceled) {
+					job.State, job.Message = domain.JobCancelled, "Certificate issuance cancelled after DNS cleanup"
+				}
 				job.FinishedAt, job.UpdatedAt = &finished, finished
-				_ = s.Repository.SaveJob(context.WithoutCancel(groupCtx), job)
+				_ = s.saveJob(context.WithoutCancel(groupCtx), job)
 				failure := IssueFailure{ZoneID: item.zone.ID, Name: item.zone.Name, Error: issueErr.Error()}
 				outcomes[index] = zoneOutcome{failure: &failure, err: fmt.Errorf("%s: %w", item.zone.Name, issueErr)}
 				return nil
@@ -179,6 +194,9 @@ func (s *CertificateService) IssueZones(ctx context.Context, request IssueZonesR
 
 			// Once the CA has issued material, finalization must get a brief chance
 			// to persist it even if the caller cancels the remaining bulk job.
+			job.State, job.Progress = domain.JobRunning, 90
+			job.Message, job.UpdatedAt = "Storing and activating issued certificate", s.now().UTC()
+			_ = s.saveJob(context.WithoutCancel(groupCtx), job)
 			finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(groupCtx), 2*time.Minute)
 			defer cancel()
 			var previous *domain.CertificateLineage
@@ -209,7 +227,7 @@ func (s *CertificateService) IssueZones(ctx context.Context, request IssueZonesR
 			}
 			job.Progress = 100
 			job.FinishedAt, job.UpdatedAt = &finished, finished
-			_ = s.Repository.SaveJob(finalizeCtx, job)
+			_ = s.saveJob(finalizeCtx, job)
 			return nil
 		})
 	}
@@ -231,6 +249,14 @@ func (s *CertificateService) IssueZones(ctx context.Context, request IssueZonesR
 		failures = append(failures, groupErr)
 	}
 	return result, errors.Join(failures...)
+}
+
+func (s *CertificateService) saveJob(ctx context.Context, job domain.Job) error {
+	err := s.Repository.SaveJob(ctx, job)
+	if s.JobObserver != nil {
+		s.JobObserver(job)
+	}
+	return err
 }
 
 func (s *CertificateService) RenewDue(ctx context.Context, environment string, confirmProduction bool) (IssueZonesResult, error) {
@@ -299,22 +325,39 @@ func (s *CertificateService) RenewDue(ctx context.Context, environment string, c
 		group.Go(func() error {
 			started := s.now()
 			job := domain.Job{ID: identifier.New("job"), Kind: "certificate.renew", State: domain.JobRunning, ResourceID: item.zone.ID, Progress: 5, Message: "Renewing " + item.lineage.Name, CreatedAt: started, StartedAt: &started, UpdatedAt: started}
-			if saveErr := s.Repository.SaveJob(groupCtx, job); saveErr != nil {
+			if saveErr := s.saveJob(groupCtx, job); saveErr != nil {
 				return saveErr
 			}
 			plan := certificates.Plan{Name: item.lineage.Name, ZoneID: item.zone.ID, ZoneName: item.zone.Name, Identifiers: slices.Clone(item.lineage.Identifiers), KeyAlgorithm: item.lineage.KeyAlgorithm, Profile: item.lineage.Profile}
-			issued, renewErr := s.Engine.Renew(groupCtx, certificates.RenewRequest{IssueRequest: certificates.IssueRequest{JobID: job.ID, Environment: environment, Plan: plan, ConfirmProduction: confirmProduction}, PreviousCertificatePEM: item.certificatePEM})
+			issued, renewErr := s.Engine.Renew(groupCtx, certificates.RenewRequest{IssueRequest: certificates.IssueRequest{
+				JobID: job.ID, Environment: environment, Plan: plan, ConfirmProduction: confirmProduction,
+				Progress: func(progress certificates.IssueProgress) {
+					job.Progress, job.Message, job.UpdatedAt = progress.Percent, item.lineage.Name+" · "+progress.Message, s.now().UTC()
+					if progress.WaitingDNS {
+						job.State = domain.JobWaitingForDNS
+					} else {
+						job.State = domain.JobRunning
+					}
+					_ = s.saveJob(groupCtx, job)
+				},
+			}, PreviousCertificatePEM: item.certificatePEM})
 			finished := s.now()
 			if renewErr != nil {
 				job.State, job.Progress, job.Message, job.Error = domain.JobFailed, 100, "Certificate renewal failed", renewErr.Error()
+				if errors.Is(renewErr, context.Canceled) {
+					job.State, job.Message = domain.JobCancelled, "Certificate renewal cancelled after DNS cleanup"
+				}
 				job.FinishedAt, job.UpdatedAt = &finished, finished
-				_ = s.Repository.SaveJob(context.Background(), job)
+				_ = s.saveJob(context.Background(), job)
 				resultMu.Lock()
 				result.Failed = append(result.Failed, IssueFailure{ZoneID: item.zone.ID, Name: item.lineage.Name, Error: renewErr.Error()})
 				failures = append(failures, fmt.Errorf("%s: %w", item.lineage.Name, renewErr))
 				resultMu.Unlock()
 				return nil
 			}
+			job.State, job.Progress = domain.JobRunning, 90
+			job.Message, job.UpdatedAt = "Storing and activating renewed certificate", s.now().UTC()
+			_ = s.saveJob(context.WithoutCancel(groupCtx), job)
 			finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(groupCtx), 2*time.Minute)
 			defer cancel()
 			exportRoot := s.managedExportRoot(environment, item.zone.Name)
@@ -339,7 +382,7 @@ func (s *CertificateService) RenewDue(ctx context.Context, environment string, c
 				resultMu.Unlock()
 			}
 			job.Progress, job.FinishedAt, job.UpdatedAt = 100, &finished, finished
-			_ = s.Repository.SaveJob(finalizeCtx, job)
+			_ = s.saveJob(finalizeCtx, job)
 			return nil
 		})
 	}

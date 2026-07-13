@@ -404,6 +404,10 @@ func TestJournaledDNSProviderExactRecordLifecycle(t *testing.T) {
 		return provider.Auth{CredentialID: "credential-1", Token: "secret"}, "zone-1", nil
 	}
 	dnsProvider := NewJournaledDNSProvider(solver, repository, resolver, "job-1")
+	var presentedDomain, presentedFQDN string
+	dnsProvider.OnPresented = func(domainName, fqdn string) {
+		presentedDomain, presentedFQDN = domainName, fqdn
+	}
 	if err := dnsProvider.Present(context.Background(), "example.com", "token-1", "key-auth"); err != nil {
 		t.Fatal(err)
 	}
@@ -413,8 +417,16 @@ func TestJournaledDNSProviderExactRecordLifecycle(t *testing.T) {
 	if repository.challenges[0].ValueHash == "" || solver.presentedJob != "job-1" {
 		t.Fatalf("challenge was not hashed/tagged: %#v", repository.challenges[0])
 	}
-	if err := dnsProvider.CleanUp(context.Background(), "example.com", "token-1", "key-auth"); err != nil {
+	if presentedDomain != "example.com" || presentedFQDN != "_acme-challenge.example.com." {
+		t.Fatalf("presented callback = %q, %q", presentedDomain, presentedFQDN)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := dnsProvider.CleanUp(cancelled, "example.com", "token-1", "key-auth"); err != nil {
 		t.Fatal(err)
+	}
+	if solver.cleanupContextErr != nil {
+		t.Fatalf("cleanup inherited cancelled issuance context: %v", solver.cleanupContextErr)
 	}
 	if !slices.Equal(solver.cleaned, []string{"record-1"}) {
 		t.Fatalf("cleaned = %#v", solver.cleaned)
@@ -515,6 +527,46 @@ func TestIssueBatchCapsConcurrencyAndUsesFreshKeys(t *testing.T) {
 				t.Fatal("renewal/issuance reused a private key")
 			}
 		}
+	}
+}
+
+func TestIssueDeadlineStopsAStalledBackendAndReportsStage(t *testing.T) {
+	accountKey, err := GeneratePrivateKey(domain.KeyECDSAP256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountKeyPEM, err := MarshalPrivateKeyPKCS8(accountKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registrationJSON, _ := json.Marshal(&acme.ExtendedAccount{Location: "https://acme.test/acct/1"})
+	repository := &memoryRepository{account: domain.ACMEAccount{
+		ID: "account-1", Environment: EnvironmentStaging, DirectoryURL: "https://acme.test/directory",
+		Email: "ops@example.com", Registration: string(registrationJSON), SecretRef: "secret-1",
+	}}
+	secrets := &memorySecrets{values: map[string][]byte{"secret-1": accountKeyPEM}}
+	backend := &fakeBackend{obtainDelay: time.Hour}
+	engine := NewEngine(repository, secrets, &fakeSolver{}, func(context.Context, string) (provider.Auth, string, error) {
+		return provider.Auth{}, "zone-1", nil
+	}, WithBackendFactory(fakeBackendFactory{backend: backend}), WithIssuanceTimeout(40*time.Millisecond))
+	plan, err := NewWildcardPlan("zone-1", "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var progress []IssueProgress
+	started := time.Now()
+	_, err = engine.Issue(context.Background(), IssueRequest{
+		JobID: "job", Environment: EnvironmentStaging, Plan: plan,
+		Progress: func(value IssueProgress) { progress = append(progress, value) },
+	})
+	if err == nil || !strings.Contains(err.Error(), "safety deadline") || !strings.Contains(err.Error(), "acme-validation") {
+		t.Fatalf("deadline error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled issue returned after %s", elapsed)
+	}
+	if len(progress) < 2 || progress[0].Stage != "preflight" || progress[1].Stage != "acme-order" {
+		t.Fatalf("progress = %#v", progress)
 	}
 }
 
@@ -1093,8 +1145,9 @@ func testVersion(id, lineageID string, artifact Artifact) domain.CertificateVers
 }
 
 type fakeSolver struct {
-	presentedJob string
-	cleaned      []string
+	presentedJob      string
+	cleaned           []string
+	cleanupContextErr error
 }
 
 type recoverySolver struct {
@@ -1120,7 +1173,8 @@ func (s *fakeSolver) PresentDNS01(_ context.Context, _ provider.Auth, _, _, _, j
 	s.presentedJob = jobID
 	return "record-1", nil
 }
-func (s *fakeSolver) CleanupDNS01(_ context.Context, _ provider.Auth, _ string, recordID string) error {
+func (s *fakeSolver) CleanupDNS01(ctx context.Context, _ provider.Auth, _ string, recordID string) error {
+	s.cleanupContextErr = ctx.Err()
 	s.cleaned = append(s.cleaned, recordID)
 	return nil
 }
@@ -1291,6 +1345,7 @@ type fakeBackend struct {
 	replaces     []string
 	renewalInfo  *certificate.RenewalInfo
 	renewalErr   error
+	obtainDelay  time.Duration
 }
 
 func (b *fakeBackend) Obtain(ctx context.Context, request certificate.ObtainRequest) (*certificate.Resource, error) {
@@ -1302,8 +1357,12 @@ func (b *fakeBackend) Obtain(ctx context.Context, request certificate.ObtainRequ
 		}
 	}
 	defer b.active.Add(-1)
+	delay := b.obtainDelay
+	if delay <= 0 {
+		delay = 15 * time.Millisecond
+	}
 	select {
-	case <-time.After(15 * time.Millisecond):
+	case <-time.After(delay):
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

@@ -1158,6 +1158,23 @@ func TestDNS01RouterDispatchesExactProviderAndCredential(t *testing.T) {
 	}
 }
 
+func TestCertificateServicePublishesStructuredJobProgress(t *testing.T) {
+	service := New(nil, nil)
+	certificates := &CertificateService{}
+	service.SetCertificateService(certificates)
+	job := domain.Job{ID: "job-1", Kind: "certificate.issue", State: domain.JobWaitingForDNS, Progress: 45, Message: "Waiting for authoritative DNS propagation"}
+	certificates.JobObserver(job)
+	select {
+	case event := <-service.Events():
+		observed, ok := event.Value.(domain.Job)
+		if event.Kind != "certificate.progress" || event.Message != job.Message || !ok || observed.ID != job.ID || observed.State != job.State || observed.Progress != job.Progress {
+			t.Fatalf("certificate event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("certificate progress event was not published")
+	}
+}
+
 func TestOptionalProviderCapabilitiesFailClearly(t *testing.T) {
 	fake := newFakeCloudProvider()
 	service, _, zone := newBatchTestService(t, fake)

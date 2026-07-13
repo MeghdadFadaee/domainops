@@ -35,6 +35,9 @@ func (m *Model) render() string {
 	if m.preferCredential {
 		return m.renderPreferredCredentialForm()
 	}
+	if m.certificateRun != nil && m.certificateRun.Visible {
+		return m.renderCertificateRun()
+	}
 	if m.editRecord {
 		return m.renderRecordForm()
 	}
@@ -71,6 +74,114 @@ func (m *Model) render() string {
 	return m.theme.app.Width(m.width).Height(m.height).Render(header + "\n" + body + "\n" + foot)
 }
 
+func (m *Model) renderCertificateRun() string {
+	run := m.certificateRun
+	contentWidth := max(36, min(86, m.width-14))
+	progress, succeeded, failed, waiting, running := certificateRunSummary(run)
+	state := m.theme.statusWarn.Render("◌ WORKING")
+	if run.CancelRequested && !run.Done {
+		state = m.theme.statusWarn.Render("◌ CANCELLING SAFELY")
+	}
+	if run.Done && run.Err == nil {
+		state = m.theme.statusOK.Render("● COMPLETE")
+	}
+	if run.Done && run.Err != nil {
+		state = m.theme.statusBad.Render("● FINISHED WITH ERRORS")
+	}
+	elapsed := time.Since(run.StartedAt).Round(time.Second)
+	remaining := time.Until(run.Deadline).Round(time.Second)
+	if remaining < 0 {
+		remaining = 0
+	}
+	lines := []string{
+		m.theme.brand.Render(run.Title),
+		state + m.theme.mutedText.Render(fmt.Sprintf("  %d/%d done · %d DNS · %d failed · %d active", succeeded, run.TargetCount, waiting, failed, running)),
+		renderProgressBar(m.theme, contentWidth, progress),
+		m.theme.mutedText.Render(certificateRunTiming(elapsed, remaining, run.Deadline)),
+	}
+	maxEntries := certificateActivityWindow(m.height)
+	end := max(0, len(run.Activity)-run.ActivityScroll)
+	start := max(0, end-maxEntries)
+	position := "empty"
+	if end > 0 {
+		position = fmt.Sprintf("%d–%d / %d", start+1, end, len(run.Activity))
+	}
+	lines = append(lines, m.theme.panelTitle.Render("ACTIVITY · "+position+" · ↑/↓ scroll"))
+	for _, activity := range run.Activity[start:end] {
+		icon := "◌"
+		style := m.theme.mutedText
+		switch activity.State {
+		case domain.JobSucceeded:
+			icon, style = "✓", m.theme.statusOK
+		case domain.JobFailed:
+			icon, style = "!", m.theme.statusBad
+		case domain.JobCancelled:
+			icon, style = "×", m.theme.statusWarn
+		case domain.JobWaitingForDNS:
+			icon, style = "↻", m.theme.statusWarn
+		}
+		message := activity.Message
+		if activity.Error != "" {
+			message += " · " + activity.Error
+		}
+		line := fmt.Sprintf("%s %s %3d%%  %s", activity.At.Format("15:04:05"), icon, activity.Progress, message)
+		lines = append(lines, style.Render(truncate(line, contentWidth)))
+	}
+	if run.Done {
+		summary := run.Summary
+		if run.Err != nil {
+			summary += " · " + run.Err.Error()
+		}
+		lines = append(lines, m.theme.mutedText.Render(truncate(summary, contentWidth)), m.theme.mutedText.Render("Enter / Esc close"))
+	} else if run.CancelRequested {
+		lines = append(lines, m.theme.mutedText.Render("Waiting for ACME/DNS cleanup to finish…"))
+	} else {
+		lines = append(lines, m.theme.mutedText.Render("↑/↓ scroll · b background · c/Esc cancel safely"))
+	}
+	modal := m.theme.modal.Width(min(92, m.width-8)).Render(strings.Join(lines, "\n"))
+	return m.theme.app.Width(m.width).Height(m.height).Render(lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal))
+}
+
+func certificateRunTiming(elapsed, remaining time.Duration, deadline time.Time) string {
+	if deadline.IsZero() {
+		return fmt.Sprintf("Elapsed %s · bounded by the operation context", elapsed)
+	}
+	return fmt.Sprintf("Elapsed %s · safety deadline in %s", elapsed, remaining)
+}
+
+func certificateRunSummary(run *certificateRunState) (progress, succeeded, failed, waiting, running int) {
+	if run == nil || run.TargetCount < 1 {
+		return 0, 0, 0, 0, 0
+	}
+	total := 0
+	for _, job := range run.Jobs {
+		total += max(0, min(100, job.Progress))
+		switch job.State {
+		case domain.JobSucceeded:
+			succeeded++
+		case domain.JobFailed, domain.JobCancelled:
+			failed++
+		case domain.JobWaitingForDNS:
+			waiting++
+		case domain.JobRunning, domain.JobQueued:
+			running++
+		}
+	}
+	progress = min(100, total/run.TargetCount)
+	if run.Done && run.Err == nil {
+		progress = 100
+	}
+	return progress, succeeded, failed, waiting, running
+}
+
+func renderProgressBar(theme theme, width, progress int) string {
+	barWidth := max(10, width-2)
+	filled := barWidth * max(0, min(100, progress)) / 100
+	done := lipgloss.NewStyle().Background(theme.primary).Render(strings.Repeat(" ", filled))
+	pending := lipgloss.NewStyle().Background(theme.surface2).Render(strings.Repeat(" ", barWidth-filled))
+	return "[" + done + pending + "]"
+}
+
 func (m *Model) renderHeader() string {
 	brand := m.theme.brand.Render("◆ DOMAINOPS")
 	section := m.theme.mutedText.Render("  /  " + screens[m.screen].name)
@@ -98,6 +209,14 @@ func (m *Model) renderFooter() string {
 		right = m.theme.key.Render("a") + " add  " + m.theme.key.Render("d") + " remove  " + m.theme.key.Render("q") + " quit"
 	case screenZones:
 		right = m.theme.key.Render("p") + " set route  " + m.theme.key.Render("Enter") + " DNS  " + m.theme.key.Render("q") + " quit"
+	}
+	if m.certificateRun != nil && !m.certificateRun.Visible {
+		if m.width < 88 {
+			left = m.theme.key.Render("?") + " help"
+			right = m.theme.key.Render("o") + " progress"
+		} else {
+			right = m.theme.key.Render("o") + " progress  " + right
+		}
 	}
 	if m.recoveryBlocked {
 		right = m.theme.key.Render("R") + " retry recovery  " + m.theme.key.Render("q") + " quit"

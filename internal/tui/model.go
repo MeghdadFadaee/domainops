@@ -174,6 +174,7 @@ type Model struct {
 	certificateIssueZoneValue    string
 	certificateLineageID         string
 	certificateExpectedName      string
+	certificateRun               *certificateRunState
 }
 
 type loadMsg struct {
@@ -198,9 +199,44 @@ type loadMsg struct {
 }
 
 type operationMsg struct {
-	message string
-	err     error
-	reload  bool
+	message     string
+	err         error
+	reload      bool
+	certificate bool
+}
+
+type backendEventMsg struct {
+	event app.Event
+	ok    bool
+}
+
+type certificateTickMsg time.Time
+
+type certificateActivity struct {
+	At       time.Time
+	JobID    string
+	State    domain.JobState
+	Progress int
+	Message  string
+	Error    string
+}
+
+type certificateRunState struct {
+	Title           string
+	StartedAt       time.Time
+	Deadline        time.Time
+	TargetCount     int
+	Jobs            map[string]domain.Job
+	Order           []string
+	Activity        []certificateActivity
+	ActivityScroll  int
+	Cancel          context.CancelFunc
+	CancelRequested bool
+	Ticking         bool
+	Visible         bool
+	Done            bool
+	Summary         string
+	Err             error
 }
 
 type unlockMsg struct{ err error }
@@ -240,14 +276,35 @@ func makePasswordInputs(first bool) []textinput.Model {
 }
 
 func (m *Model) Init() tea.Cmd {
+	commands := make([]tea.Cmd, 0, 2)
 	if m.unlock {
-		return textinput.Blink
+		commands = append(commands, textinput.Blink)
+	} else {
+		commands = append(commands, m.startLoad("", false, false))
 	}
-	return m.startLoad("", false, false)
+	if command := waitForBackendEvent(m.backend); command != nil {
+		commands = append(commands, command)
+	}
+	return tea.Batch(commands...)
 }
 
 func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
+	case backendEventMsg:
+		if msg.ok {
+			m.applyBackendEvent(msg.event)
+			if m.certificateRun != nil && !m.certificateRun.Done && !m.certificateRun.Ticking {
+				m.certificateRun.Ticking = true
+				return m, tea.Batch(waitForBackendEvent(m.backend), certificateTickCmd())
+			}
+			return m, waitForBackendEvent(m.backend)
+		}
+		return m, nil
+	case certificateTickMsg:
+		if m.certificateRun != nil && !m.certificateRun.Done {
+			return m, certificateTickCmd()
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeInputs()
@@ -297,6 +354,13 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case operationMsg:
 		m.err = msg.err
 		m.operationErr = msg.err
+		if msg.certificate && m.certificateRun != nil {
+			m.certificateRun.Done = true
+			m.certificateRun.Visible = true
+			m.certificateRun.Summary = msg.message
+			m.certificateRun.Err = msg.err
+			m.certificateRun.Cancel = nil
+		}
 		if msg.err == nil {
 			m.toast, m.toastAt = msg.message, time.Now()
 		}
@@ -343,6 +407,9 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		return m, nil
+	}
+	if m.certificateRun != nil && m.certificateRun.Visible {
+		return m.updateCertificateRun(message)
 	}
 	if key, ok := message.(tea.KeyPressMsg); ok && m.recoveryBlocked && key.String() == "R" {
 		if m.busy || m.loading {
@@ -410,6 +477,15 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if m.screen == screenTLS && m.isTLSMutationKey(key.String()) && !m.tlsSnapshotReadyForSelectedZone() {
 		m.toast, m.toastAt = "Load this zone’s TLS snapshot before editing", time.Now()
+		return m, nil
+	}
+	if m.certificateRun != nil && key.String() == "o" {
+		m.certificateRun.Visible = true
+		return m, nil
+	}
+	if m.certificateRun != nil && !m.certificateRun.Done && (key.String() == "q" || key.String() == "ctrl+c") {
+		m.certificateRun.Visible = true
+		m.toast, m.toastAt = "Cancel the certificate operation and wait for DNS cleanup before quitting", time.Now()
 		return m, nil
 	}
 	switch key.String() {
@@ -1557,16 +1633,18 @@ func (m *Model) submitCertificateForm() tea.Cmd {
 			ConfirmProduction: m.certificateConfirmProduction,
 			KeyAlgorithm:      domain.KeyAlgorithm(strings.ToUpper(inputs[4])),
 		}
-		return func() tea.Msg {
-			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
+		ctx, cancel := context.WithTimeout(context.Background(), certificateBatchTimeout(len(zoneIDs)))
+		m.beginCertificateRun("ISSUING WILDCARD CERTIFICATES", len(zoneIDs), ctx, cancel)
+		command := func() tea.Msg {
 			defer cancel()
 			result, issueErr := m.backend.IssueCertificates(ctx, request)
 			message := fmt.Sprintf("Issued %d certificate(s)", len(result.Completed))
 			if warnings := result.WarningCount(); warnings > 0 {
 				message += fmt.Sprintf(" with %d activation warning(s)", warnings)
 			}
-			return operationMsg{message: message, err: issueErr, reload: true}
+			return operationMsg{message: message, err: issueErr, reload: true, certificate: true}
 		}
+		return command
 	case "import":
 		zoneID := ""
 		if inputs[2] != "" {
@@ -1618,19 +1696,157 @@ func (m *Model) submitCertificateForm() tea.Cmd {
 			return operationMsg{message: "Certificate revoked", err: revokeErr, reload: true}
 		}
 	case "renew":
-		return func() tea.Msg {
-			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
+		targets := max(1, len(m.filteredLineages()))
+		ctx, cancel := context.WithTimeout(context.Background(), certificateBatchTimeout(targets))
+		m.beginCertificateRun("RENEWING DUE CERTIFICATES", targets, ctx, cancel)
+		command := func() tea.Msg {
 			defer cancel()
 			result, renewErr := m.backend.RenewCertificates(ctx, strings.ToLower(inputs[0]), m.certificateConfirmProduction)
 			message := fmt.Sprintf("Renewed %d certificate(s)", len(result.Completed))
 			if warnings := result.WarningCount(); warnings > 0 {
 				message += fmt.Sprintf(" with %d activation warning(s)", warnings)
 			}
-			return operationMsg{message: message, err: renewErr, reload: true}
+			return operationMsg{message: message, err: renewErr, reload: true, certificate: true}
 		}
+		return command
 	}
 	m.busy = false
 	return nil
+}
+
+func waitForBackendEvent(backend Backend) tea.Cmd {
+	source, ok := backend.(interface{ Events() <-chan app.Event })
+	if !ok {
+		return nil
+	}
+	events := source.Events()
+	if events == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		event, open := <-events
+		return backendEventMsg{event: event, ok: open}
+	}
+}
+
+func certificateTickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(at time.Time) tea.Msg { return certificateTickMsg(at) })
+}
+
+func certificateBatchTimeout(targets int) time.Duration {
+	if targets < 1 {
+		targets = 1
+	}
+	waves := (targets + 2) / 3
+	timeout := time.Duration(waves)*11*time.Minute + 2*time.Minute
+	if timeout > 4*time.Hour {
+		return 4 * time.Hour
+	}
+	return timeout
+}
+
+func (m *Model) beginCertificateRun(title string, targets int, ctx context.Context, cancel context.CancelFunc) {
+	deadline, _ := ctx.Deadline()
+	m.certificateRun = &certificateRunState{
+		Title: title, StartedAt: time.Now(), Deadline: deadline, TargetCount: max(1, targets),
+		Jobs: make(map[string]domain.Job), Cancel: cancel, Visible: true,
+	}
+	m.certificateRun.Activity = append(m.certificateRun.Activity, certificateActivity{
+		At: time.Now(), State: domain.JobQueued,
+		Message: fmt.Sprintf("Queued %d certificate order(s); up to 3 run concurrently", m.certificateRun.TargetCount),
+	})
+}
+
+func (m *Model) applyBackendEvent(event app.Event) {
+	if event.Kind != "certificate.progress" || m.certificateRun == nil {
+		return
+	}
+	job, ok := event.Value.(domain.Job)
+	if !ok {
+		if pointer, pointerOK := event.Value.(*domain.Job); pointerOK && pointer != nil {
+			job, ok = *pointer, true
+		}
+	}
+	if !ok || job.ID == "" {
+		return
+	}
+	previous, existed := m.certificateRun.Jobs[job.ID]
+	m.certificateRun.Jobs[job.ID] = job
+	if !existed {
+		m.certificateRun.Order = append(m.certificateRun.Order, job.ID)
+	}
+	if existed && previous.State == job.State && previous.Progress == job.Progress && previous.Message == job.Message && previous.Error == job.Error {
+		return
+	}
+	at := job.UpdatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	m.certificateRun.Activity = append(m.certificateRun.Activity, certificateActivity{
+		At: at, JobID: job.ID, State: job.State, Progress: job.Progress, Message: job.Message, Error: job.Error,
+	})
+	if m.certificateRun.ActivityScroll > 0 {
+		m.certificateRun.ActivityScroll++
+	}
+	if len(m.certificateRun.Activity) > 500 {
+		dropped := len(m.certificateRun.Activity) - 500
+		m.certificateRun.Activity = append([]certificateActivity(nil), m.certificateRun.Activity[dropped:]...)
+		m.certificateRun.ActivityScroll = max(0, m.certificateRun.ActivityScroll-dropped)
+	}
+}
+
+func (m *Model) updateCertificateRun(message tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := message.(tea.KeyPressMsg)
+	if !ok {
+		return m, nil
+	}
+	window := certificateActivityWindow(m.height)
+	maxScroll := max(0, len(m.certificateRun.Activity)-window)
+	switch key.String() {
+	case "up", "k":
+		m.certificateRun.ActivityScroll = min(maxScroll, m.certificateRun.ActivityScroll+1)
+		return m, nil
+	case "down", "j":
+		m.certificateRun.ActivityScroll = max(0, m.certificateRun.ActivityScroll-1)
+		return m, nil
+	case "pgup":
+		m.certificateRun.ActivityScroll = min(maxScroll, m.certificateRun.ActivityScroll+window)
+		return m, nil
+	case "pgdown":
+		m.certificateRun.ActivityScroll = max(0, m.certificateRun.ActivityScroll-window)
+		return m, nil
+	case "home":
+		m.certificateRun.ActivityScroll = maxScroll
+		return m, nil
+	case "end":
+		m.certificateRun.ActivityScroll = 0
+		return m, nil
+	case "b":
+		m.certificateRun.Visible = false
+		return m, nil
+	}
+	if m.certificateRun.Done {
+		if key.String() == "enter" || key.String() == "esc" {
+			m.certificateRun = nil
+		}
+		return m, nil
+	}
+	if key.String() == "c" || key.String() == "esc" || key.String() == "ctrl+c" {
+		if !m.certificateRun.CancelRequested {
+			m.certificateRun.CancelRequested = true
+			m.certificateRun.Activity = append(m.certificateRun.Activity, certificateActivity{
+				At: time.Now(), State: domain.JobCancelled, Message: "Cancellation requested; safely cleaning DNS challenges",
+			})
+			if m.certificateRun.Cancel != nil {
+				m.certificateRun.Cancel()
+			}
+		}
+	}
+	return m, nil
+}
+
+func certificateActivityWindow(height int) int {
+	return max(2, min(7, height-14))
 }
 
 func (m *Model) resolveZoneValues(values []string) ([]string, error) {

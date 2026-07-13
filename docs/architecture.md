@@ -40,6 +40,8 @@ Credential identities and remote accounts are separate. One user token may expos
 
 Operator-facing removal and routing retain immutable local credential/zone IDs across confirmation and reload. Removing a local connection can reassign preferred routes only after recent per-zone write evidence plus a fresh DNS read through the replacement. Explicit routing verifies DNS read immediately; write authority remains visibly unproven until Cloudflare accepts a real mutation.
 
+ACME library output never owns stdout. Certificate stages are converted into persisted jobs and non-blocking application events; the TUI consumes those events in a bounded, scrollable progress console. Each order has an independent safety deadline, while cleanup detaches from an expired issuance context for one bounded attempt to remove the exact journaled TXT record.
+
 After a successful full sync, a zone no longer visible to its preferred credential is retained as cached history but marked unknown and detached from that stale preference. DNS-read authority is also stored per credential and zone. An authoritative 401/403 on a later zone read atomically removes that evidence and detaches only the denied route, while transient transport, rate-limit, and server failures preserve the last successful observation. A later credential that rediscovers the zone can restore routing without trapping credential removal behind an unreachable zone.
 
 Future providers should implement only their supported capabilities and register statically. A future third-party plugin system should be an out-of-process, versioned protocol rather than Go’s in-process plugin mechanism.

@@ -22,3 +22,4 @@
 - Safe TUI connection removal and explicit zone routing with immutable-ID confirmations, affected-route disclosure, and write-unproven warnings.
 - Provider-neutral DNS-01 dispatch plus optional batch/TLS capabilities, preserving Cloudflare behavior while preparing additional adapters.
 - Public-repository hardening with pinned least-privilege CI/release workflows, vulnerability scanning, Dependabot, contribution guidance, private security reporting, and release documentation.
+- In-TUI certificate progress with scrollable bounded activity, safe cancellation, per-order deadlines, authoritative DNS propagation checks, and isolation of lego logs from terminal/JSON output.
