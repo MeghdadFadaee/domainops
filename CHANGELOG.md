@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.0 - 2026-07-13
+
 - Initial DomainOps implementation.
 - Multi-account Cloudflare inventory and DNS management.
 - Cloudflare core TLS controls and edge certificate inventory.
