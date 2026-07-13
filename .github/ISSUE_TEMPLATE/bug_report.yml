@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible DomainOps defect without including secrets.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never include API tokens, vault files, vault passwords, private keys, certificates, database files, or sensitive production-domain data. Use the private security advisory link for vulnerabilities.
+  - type: input
+    id: version
+    attributes:
+      label: DomainOps version
+      description: Run `domainops version` and paste only the version, commit, and build date.
+      placeholder: "DomainOps 0.1.0 (commit, date)"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux amd64
+        - Linux arm64
+        - macOS amd64
+        - macOS arm64
+        - Other unsupported platform
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include the expected result, actual result, and minimal reproduction with domains anonymized.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized output
+      description: Remove tokens, account IDs, credential IDs, domains, IPs, certificate material, filesystem usernames, and vault/database contents.
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive-data confirmation
+      options:
+        - label: I removed all credentials, private material, and sensitive infrastructure identifiers.
+          required: true

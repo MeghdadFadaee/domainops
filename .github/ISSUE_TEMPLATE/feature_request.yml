@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose an operator workflow or provider capability.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Operator problem
+      description: Describe the workflow or risk this feature should address.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the desired TUI/CLI behavior, provider scope, and safety expectations.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive-data confirmation
+      options:
+        - label: This request contains no credentials, private keys, or sensitive production-domain data.
+          required: true

@@ -6,6 +6,8 @@ builds:
   - id: domainops
     main: ./cmd/domainops
     binary: domainops
+    flags:
+      - -trimpath
     env:
       - CGO_ENABLED=0
     goos:
@@ -19,13 +21,28 @@ builds:
       - -X github.com/MeghdadFadaee/domainops/internal/buildinfo.Version={{.Version}}
       - -X github.com/MeghdadFadaee/domainops/internal/buildinfo.Commit={{.Commit}}
       - -X github.com/MeghdadFadaee/domainops/internal/buildinfo.Date={{.Date}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
   - formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE*
+      - README.md
+      - CHANGELOG.md
+      - THIRD_PARTY_LICENSES/**/*
 
 checksum:
   name_template: checksums.txt
 
 changelog:
   sort: asc
+  use: github
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+release:
+  prerelease: auto

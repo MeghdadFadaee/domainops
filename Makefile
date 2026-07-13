@@ -1,4 +1,4 @@
-.PHONY: build test race lint fmt check snapshot clean
+.PHONY: build test race lint fmt fmt-check vuln licenses verify check snapshot clean
 
 APP := domainops
 VERSION ?= dev
@@ -21,12 +21,28 @@ race:
 fmt:
 	gofmt -w $$(find cmd internal -name '*.go' -type f)
 
+fmt-check:
+	test -z "$$(gofmt -l cmd internal)"
+
 lint:
 	go vet ./...
 
-check:
-	$(MAKE) lint
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+licenses:
+	go run github.com/google/go-licenses@v1.6.0 save ./cmd/domainops \
+		--ignore github.com/MeghdadFadaee/domainops \
+		--confidence_threshold 0.7 \
+		--save_path THIRD_PARTY_LICENSES \
+		--force
+
+verify: fmt-check
+	go mod verify
 	go test ./...
+	go vet ./...
+
+check: verify
 
 snapshot:
 	goreleaser release --snapshot --clean

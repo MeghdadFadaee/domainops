@@ -19,6 +19,7 @@ var fixedNow = time.Date(2026, time.July, 11, 9, 30, 0, 0, time.UTC)
 
 func testAuth() provider.Auth {
 	return provider.Auth{
+		Provider:     domain.ProviderCloudflare,
 		CredentialID: "cred-1",
 		Token:        "test-secret-token",
 		Kind:         domain.CredentialUserToken,

@@ -1,8 +1,14 @@
 # DomainOps
 
+[![CI](https://github.com/MeghdadFadaee/domainops/actions/workflows/ci.yml/badge.svg)](https://github.com/MeghdadFadaee/domainops/actions/workflows/ci.yml)
+[![Go version](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)](https://go.dev/)
+
 DomainOps is a local-first terminal console for managing domains, DNS, Cloudflare TLS, and locally owned ACME certificates. It is designed for operators with many zones across multiple accounts and remains usable over SSH on a minimal Linux server.
 
 The default command opens a full-screen Bubble Tea v2 interface. The same engine also exposes stable JSON commands for scripts.
+
+> [!IMPORTANT]
+> DomainOps is prerelease software that can modify authoritative DNS and handle deployable private keys. Start with a dedicated test zone and Let’s Encrypt staging, review every mutation, and maintain protected backups of the data directory.
 
 ## Current capabilities
 
@@ -42,6 +48,8 @@ The first run creates a local vault. On macOS or a desktop Linux session, Domain
 
 No root privileges are required.
 
+Tagged releases provide checksum-protected archives for macOS and Linux on amd64 and arm64. Download the archive and `checksums.txt` from the [GitHub Releases page](https://github.com/MeghdadFadaee/domainops/releases), verify its SHA-256 digest, extract it, and move `domainops` to a directory on your `PATH`.
+
 ## Cloudflare token setup
 
 Use a scoped API token, never a Global API Key. Recommended permissions are:
@@ -56,6 +64,8 @@ Restrict the token to only the accounts and zones DomainOps should manage. For a
 
 Press `a` on the Dashboard or Accounts screen to add a token. DomainOps masks it immediately and stores it only in the encrypted vault.
 
+The Accounts view shows each local credential ID. Press `d` to remove the selected local connection—not the remote Cloudflare account. If that connection owns preferred zone routes, DomainOps live-verifies eligible replacements and fails closed unless every route can be reassigned safely. In Zones, press `p` to assign a connection explicitly; duplicate labels require the credential ID, and DNS read access is verified before the route changes. Cloudflare does not expose effective write permission, so the routing dialog marks write access as unproven until a real mutation succeeds.
+
 Cloudflare’s token-verification response does not disclose effective write scopes. DomainOps therefore labels reads from live probes and records `dns:write`/`tls:write` only after a real mutation succeeds, scoped to that credential and zone. An authoritative later DNS-access denial removes only that zone’s read evidence and detaches the denied route; network failures, rate limits, and Cloudflare 5xx responses preserve the last known-good route. Before removing a preferred connection, perform a successful DNS operation through its replacement on every affected zone within 15 minutes; DomainOps then re-probes exact-zone DNS read access, and removal otherwise fails closed.
 
 ## TUI workflow
@@ -69,6 +79,8 @@ Cloudflare’s token-verification response does not disclose effective write sco
 | `r` | Synchronize Cloudflare and run public health checks |
 | `R` | Retry blocked crash recovery after correcting the underlying problem |
 | `a` | Add a Cloudflare connection |
+| `d` | Safely remove the selected connection/token in Accounts |
+| `p` | Live-verify and set the selected zone’s preferred connection |
 | `n`, `e`, `d` | Create, edit, or delete a DNS record |
 | `n`, `u`, `i`, `x`, `d` | Issue, renew due, import, export, or revoke a certificate in the Certificates view |
 | `m`, `h`, `t`, `v` | Adjust the TLS mode, HTTPS, TLS 1.3, or minimum TLS version |
@@ -212,10 +224,15 @@ Apply revalidates the complete plan, submits one Cloudflare zone batch, reloads 
 make test
 make race
 make check
+make vuln
 ```
 
 The test suite covers Cloudflare request mapping and rate-limit errors, legacy SQLite upgrades and recovery state, encrypted-vault tampering, DNS-01 exact-record cleanup, 60-order bounded ACME batches, staging/production isolation, durable account/certificate commits and revocation retry, ARI renewal replacement, PEM validation/export, public TLS findings, non-blocking worker limits, CLI JSON envelopes, and responsive TUI rendering.
 
 Live Cloudflare and Let’s Encrypt production operations should first be exercised with a dedicated test zone and the staging CA. The automated suite never issues a real production certificate.
 
-See [architecture](docs/architecture.md) and [security](docs/security.md) for implementation boundaries and threat-model details.
+See [architecture](docs/architecture.md) and [security design](docs/security.md) for implementation boundaries and threat-model details. Contributions should follow [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately according to [SECURITY.md](SECURITY.md), never through a public issue. Maintainers should follow the [release process](docs/releasing.md).
+
+## License
+
+DomainOps is available under the [MIT License](LICENSE). Release archives also include the notices for bundled dependencies under `THIRD_PARTY_LICENSES`.

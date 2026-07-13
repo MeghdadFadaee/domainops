@@ -132,7 +132,7 @@ func TestServiceMultiCredentialSyncAndDNSLifecycle(t *testing.T) {
 	}
 
 	auth, providerZoneID, err := service.ResolveDNS01(ctx, "_acme-challenge.api.example.com.")
-	if err != nil || auth.Token != "token-one" || providerZoneID != "zone-provider" {
+	if err != nil || auth.Provider != domain.ProviderCloudflare || auth.CredentialID != first.ID || auth.Token != "token-one" || providerZoneID != "zone-provider" {
 		t.Fatalf("DNS-01 resolution = %#v, %q, %v", auth, providerZoneID, err)
 	}
 
@@ -1123,6 +1123,130 @@ func TestSetPreferredCredentialLiveProbePersistsZoneReadEvidence(t *testing.T) {
 	}
 }
 
+func TestDNS01RouterDispatchesExactProviderAndCredential(t *testing.T) {
+	service := New(nil, nil)
+	alpha := &routingProvider{name: "alpha"}
+	beta := &routingProvider{name: "beta"}
+	service.RegisterProvider("alpha", alpha)
+	service.RegisterProvider("beta", beta)
+	auth := provider.Auth{Provider: "beta", CredentialID: "credential-beta", Token: "beta-secret", Kind: domain.CredentialUserToken}
+
+	recordID, err := service.PresentDNS01(context.Background(), auth, "shared-zone-id", "_acme.example.", "value", "job-1")
+	if err != nil || recordID != "beta-record" {
+		t.Fatalf("PresentDNS01 = %q, %v", recordID, err)
+	}
+	if err := service.CleanupDNS01(context.Background(), auth, "shared-zone-id", recordID); err != nil {
+		t.Fatal(err)
+	}
+	reconciledID, found, err := service.ReconcileDNS01(context.Background(), auth, "shared-zone-id", "_acme.example.", "hash", "job-1")
+	if err != nil || !found || reconciledID != "beta-reconciled" {
+		t.Fatalf("ReconcileDNS01 = %q, %v, %v", reconciledID, found, err)
+	}
+	if len(alpha.calls) != 0 {
+		t.Fatalf("unselected provider received calls: %#v", alpha.calls)
+	}
+	if len(beta.calls) != 3 {
+		t.Fatalf("selected provider calls = %#v", beta.calls)
+	}
+	for _, call := range beta.calls {
+		if call.auth != auth || call.zoneID != "shared-zone-id" {
+			t.Fatalf("routed call changed auth/zone: %#v", call)
+		}
+	}
+	if _, err := service.PresentDNS01(context.Background(), provider.Auth{CredentialID: "credential-beta"}, "shared-zone-id", "fqdn", "value", "job"); err == nil || !strings.Contains(err.Error(), "no provider identity") {
+		t.Fatalf("provider-less auth was routed: %v", err)
+	}
+}
+
+func TestOptionalProviderCapabilitiesFailClearly(t *testing.T) {
+	fake := newFakeCloudProvider()
+	service, _, zone := newBatchTestService(t, fake)
+	service.RegisterProvider(domain.ProviderCloudflare, coreOnlyProvider{Provider: fake})
+
+	mutation := domain.DNSMutation{Kind: domain.MutationCreate, After: &domain.DNSRecord{Type: domain.RecordA, Name: "new", Content: "192.0.2.20", TTL: 300}}
+	if _, err := service.PlanDNSBatch(context.Background(), zone.ID, []domain.DNSMutation{mutation}); !errors.Is(err, provider.ErrCapabilityUnsupported) || !strings.Contains(err.Error(), "DNS batch") {
+		t.Fatalf("unsupported batch error = %v", err)
+	}
+	if _, err := service.TLSSettings(context.Background(), zone.ID, true); !errors.Is(err, provider.ErrCapabilityUnsupported) || !strings.Contains(err.Error(), "edge TLS") {
+		t.Fatalf("unsupported TLS read error = %v", err)
+	}
+	if _, err := service.EdgeCertificates(context.Background(), zone.ID); !errors.Is(err, provider.ErrCapabilityUnsupported) {
+		t.Fatalf("unsupported TLS inventory error = %v", err)
+	}
+	if _, err := service.UpdateTLSSettings(context.Background(), zone.ID, domain.EdgeTLSSettings{}); !errors.Is(err, provider.ErrCapabilityUnsupported) {
+		t.Fatalf("unsupported TLS update error = %v", err)
+	}
+	auth, err := service.ResolveCredential(context.Background(), zone.PreferredCredentialID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.ReconcileDNS01(context.Background(), auth, zone.ProviderID, "_acme.example.", "hash", "job"); !errors.Is(err, provider.ErrCapabilityUnsupported) || !strings.Contains(err.Error(), "DNS-01 reconciliation") {
+		t.Fatalf("unsupported DNS-01 reconciliation error = %v", err)
+	}
+}
+
+func TestProviderNeutralNormalizationPreservesCloudflareAndIsolatesRemoteIDs(t *testing.T) {
+	cloudflareAccount := domain.RemoteAccount{ID: "remote-account"}
+	normalizeAccount(&cloudflareAccount, domain.ProviderCloudflare)
+	if cloudflareAccount.ID != "cfacct_remote-account" || cloudflareAccount.Provider != domain.ProviderCloudflare {
+		t.Fatalf("Cloudflare account normalization changed: %#v", cloudflareAccount)
+	}
+	cloudflareZone := domain.Zone{ID: "remote-zone", AccountID: "remote-account"}
+	normalizeZone(&cloudflareZone, domain.ProviderCloudflare, "credential")
+	if cloudflareZone.ID != "cfzone_remote-zone" || cloudflareZone.AccountID != "cfacct_remote-account" {
+		t.Fatalf("Cloudflare zone normalization changed: %#v", cloudflareZone)
+	}
+	cloudflareRecord := domain.DNSRecord{ID: "remote-record"}
+	normalizeRecord(&cloudflareRecord, domain.ProviderCloudflare, cloudflareZone.ID)
+	if cloudflareRecord.ID != "cfrecord_remote-record" {
+		t.Fatalf("Cloudflare record normalization changed: %#v", cloudflareRecord)
+	}
+
+	firstZone := domain.Zone{ID: "shared-zone", AccountID: "shared-account"}
+	secondZone := firstZone
+	normalizeZone(&firstZone, "provider-a", "credential-a")
+	normalizeZone(&secondZone, "provider-b", "credential-b")
+	if firstZone.ID == secondZone.ID || firstZone.AccountID == secondZone.AccountID {
+		t.Fatalf("provider-local zone/account IDs collided: %#v / %#v", firstZone, secondZone)
+	}
+	firstRecord := domain.DNSRecord{ID: "shared-record"}
+	secondRecord := firstRecord
+	normalizeRecord(&firstRecord, "provider-a", firstZone.ID)
+	normalizeRecord(&secondRecord, "provider-b", secondZone.ID)
+	if firstRecord.ID == secondRecord.ID || firstRecord.ProviderID != "shared-record" || secondRecord.ProviderID != "shared-record" {
+		t.Fatalf("provider-local record IDs were not isolated: %#v / %#v", firstRecord, secondRecord)
+	}
+}
+
+func TestObservedCapabilityProviderIDFallbackCannotCrossProviders(t *testing.T) {
+	ctx := context.Background()
+	service, repository, cloudflareZone := newBatchTestService(t, newFakeCloudProvider())
+	credential, err := repository.GetCredential(ctx, cloudflareZone.PreferredCredentialID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignAccount := domain.RemoteAccount{ID: stableID("account", "other", "account"), Provider: "other", ProviderID: "account", Name: "Other", CreatedAt: time.Now().UTC()}
+	if err := repository.SaveAccounts(ctx, []domain.RemoteAccount{foreignAccount}, nil); err != nil {
+		t.Fatal(err)
+	}
+	foreignZone := domain.Zone{ID: stableID("zone", "other", cloudflareZone.ProviderID), Provider: "other", ProviderID: cloudflareZone.ProviderID, AccountID: foreignAccount.ID, Name: "aaa-other.example", Status: domain.ZoneActive}
+	if err := repository.SaveZones(ctx, []domain.Zone{foreignZone}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.ObserveCredentialZoneCapability(ctx, credential.ID, cloudflareZone.ProviderID, "tls:write"); err != nil {
+		t.Fatalf("provider-scoped fallback: %v", err)
+	}
+	cloudflareObserved, err := repository.HasCredentialZoneCapability(ctx, credential.ID, cloudflareZone.ID, "tls:write")
+	if err != nil || !cloudflareObserved {
+		t.Fatalf("Cloudflare observation = %v, %v", cloudflareObserved, err)
+	}
+	foreignObserved, err := repository.HasCredentialZoneCapability(ctx, credential.ID, foreignZone.ID, "tls:write")
+	if err != nil || foreignObserved {
+		t.Fatalf("foreign observation = %v, %v", foreignObserved, err)
+	}
+}
+
 func TestCredentialDeleteKeepsMetadataWhenVaultDeleteFails(t *testing.T) {
 	ctx := context.Background()
 	fake := newFakeCloudProvider()
@@ -1321,6 +1445,53 @@ func TestListAllRecordsDoesNotRepeatFinalCursorPage(t *testing.T) {
 type providerRequest struct {
 	Page   int
 	Cursor string
+}
+
+type coreOnlyProvider struct{ provider.Provider }
+
+type routingCall struct {
+	action string
+	auth   provider.Auth
+	zoneID string
+}
+
+type routingProvider struct {
+	name  string
+	calls []routingCall
+}
+
+func (p *routingProvider) VerifyCredential(context.Context, provider.Auth) (provider.Verification, error) {
+	return provider.Verification{Status: domain.CredentialValid}, nil
+}
+func (p *routingProvider) ListZones(context.Context, provider.Auth, provider.PageRequest) (provider.ZonePage, error) {
+	return provider.ZonePage{}, nil
+}
+func (p *routingProvider) ListDNSRecords(context.Context, provider.Auth, string, provider.PageRequest) (provider.RecordPage, error) {
+	return provider.RecordPage{}, nil
+}
+func (p *routingProvider) GetDNSRecord(context.Context, provider.Auth, string, string) (domain.DNSRecord, error) {
+	return domain.DNSRecord{}, nil
+}
+func (p *routingProvider) CreateDNSRecord(context.Context, provider.Auth, string, domain.DNSRecord) (domain.DNSRecord, error) {
+	return domain.DNSRecord{}, nil
+}
+func (p *routingProvider) PatchDNSRecord(context.Context, provider.Auth, string, string, domain.DNSRecord) (domain.DNSRecord, error) {
+	return domain.DNSRecord{}, nil
+}
+func (p *routingProvider) DeleteDNSRecord(context.Context, provider.Auth, string, string) error {
+	return nil
+}
+func (p *routingProvider) PresentDNS01(_ context.Context, auth provider.Auth, zoneID, _, _, _ string) (string, error) {
+	p.calls = append(p.calls, routingCall{action: "present", auth: auth, zoneID: zoneID})
+	return p.name + "-record", nil
+}
+func (p *routingProvider) CleanupDNS01(_ context.Context, auth provider.Auth, zoneID, _ string) error {
+	p.calls = append(p.calls, routingCall{action: "cleanup", auth: auth, zoneID: zoneID})
+	return nil
+}
+func (p *routingProvider) ReconcileDNS01(_ context.Context, auth provider.Auth, zoneID, _, _, _ string) (string, bool, error) {
+	p.calls = append(p.calls, routingCall{action: "reconcile", auth: auth, zoneID: zoneID})
+	return p.name + "-reconciled", true, nil
 }
 
 type paginatedZoneProvider struct{ requests []providerRequest }

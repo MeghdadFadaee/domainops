@@ -29,6 +29,8 @@ type Backend interface {
 	Jobs(context.Context, int) ([]domain.Job, error)
 	Audit(context.Context, int) ([]domain.AuditEvent, error)
 	AddCloudflareCredential(context.Context, app.AddCredentialInput) (domain.Credential, error)
+	DeleteCredential(context.Context, string) error
+	SetZonePreferredCredential(context.Context, string, string) (domain.Zone, error)
 	SyncAll(context.Context) ([]domain.Job, error)
 	CreateDNSRecord(context.Context, string, domain.DNSRecord) (domain.DNSRecord, error)
 	PatchDNSRecord(context.Context, string, string, domain.DNSRecord) (domain.DNSRecord, error)
@@ -123,9 +125,29 @@ type Model struct {
 	unlockFocus  int
 	unlockInputs []textinput.Model
 
-	addCredential    bool
-	credentialFocus  int
-	credentialInputs []textinput.Model
+	addCredential               bool
+	credentialFocus             int
+	credentialInputs            []textinput.Model
+	removeCredential            bool
+	removeCredentialInput       textinput.Model
+	removeCredentialID          string
+	removeCredentialExpected    string
+	removeCredentialKind        domain.CredentialKind
+	removeCredentialAccountHint string
+	removeCredentialZoneIDs     []string
+	removeCredentialZoneNames   []string
+
+	preferCredential              bool
+	preferCredentialFocus         int
+	preferCredentialInputs        []textinput.Model
+	preferZoneID                  string
+	preferZoneExpectedName        string
+	preferZoneProvider            string
+	preferZoneAccountID           string
+	preferOriginalCredentialID    string
+	preferResolvedCredentialID    string
+	preferResolvedCredentialLabel string
+	preferCredentialSelection     string
 
 	editRecord       bool
 	recordEditing    bool
@@ -342,6 +364,12 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	if m.addCredential {
 		return m.updateCredentialForm(message)
 	}
+	if m.removeCredential {
+		return m.updateRemoveCredentialForm(message)
+	}
+	if m.preferCredential {
+		return m.updatePreferredCredentialForm(message)
+	}
 	if m.editRecord {
 		return m.updateRecordForm(message)
 	}
@@ -406,6 +434,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.openCredentialForm()
 			return m, textinput.Blink
 		}
+	case "p":
+		if m.screen == screenZones && len(m.filteredZones()) > 0 {
+			m.openPreferredCredentialForm()
+			return m, textinput.Blink
+		}
 	case "n":
 		if m.screen == screenDNS && len(m.zones) > 0 {
 			m.openRecordForm(false)
@@ -436,6 +469,10 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		}
 	case "d":
+		if m.screen == screenAccounts && len(m.filteredCredentials()) > 0 {
+			m.openRemoveCredentialForm()
+			return m, textinput.Blink
+		}
 		if m.screen == screenDNS && len(m.filteredRecords()) > 0 {
 			m.confirmDelete = true
 		}
@@ -790,6 +827,313 @@ func (m *Model) clearCredentialForm() {
 		m.credentialInputs[i].SetValue("")
 	}
 	m.addCredential = false
+}
+
+func (m *Model) openRemoveCredentialForm() {
+	credentials := m.filteredCredentials()
+	if len(credentials) == 0 {
+		return
+	}
+	credential := credentials[min(m.rowOffset, len(credentials)-1)]
+	m.removeCredentialZoneIDs = nil
+	m.removeCredentialZoneNames = nil
+	input := textinput.New()
+	input.Prompt = ""
+	input.Placeholder = "Type the exact connection label"
+	input.SetWidth(52)
+	input.Focus()
+	m.removeCredentialInput = input
+	m.removeCredentialID = credential.ID
+	m.removeCredentialExpected = credential.Label
+	m.removeCredentialKind = credential.Kind
+	m.removeCredentialAccountHint = credential.AccountHint
+	for _, zone := range m.zones {
+		if zone.PreferredCredentialID == credential.ID {
+			m.removeCredentialZoneIDs = append(m.removeCredentialZoneIDs, zone.ID)
+			m.removeCredentialZoneNames = append(m.removeCredentialZoneNames, zone.Name)
+		}
+	}
+	m.removeCredential = true
+	m.err = nil
+}
+
+func (m *Model) updateRemoveCredentialForm(message tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := message.(tea.KeyPressMsg); ok {
+		switch key.String() {
+		case "esc":
+			m.clearRemoveCredentialForm()
+			return m, nil
+		case "enter":
+			if m.mutationFormBlocked() {
+				return m, nil
+			}
+			credential, ok := m.credentialByID(m.removeCredentialID)
+			if !ok || credential.Label != m.removeCredentialExpected {
+				m.err = errors.New("the selected connection changed; cancel and select it again")
+				return m, nil
+			}
+			if !m.removeCredentialRoutesUnchanged() {
+				m.err = errors.New("the affected zone routes changed; cancel and review the removal again")
+				return m, nil
+			}
+			if m.removeCredentialInput.Value() != m.removeCredentialExpected {
+				m.err = fmt.Errorf("type %q exactly to confirm removal", m.removeCredentialExpected)
+				return m, nil
+			}
+			credentialID := m.removeCredentialID
+			label := m.removeCredentialExpected
+			m.clearRemoveCredentialForm()
+			m.busy = true
+			return m, func() tea.Msg {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+				defer cancel()
+				err := m.backend.DeleteCredential(ctx, credentialID)
+				return operationMsg{message: "Removed Cloudflare connection " + label, err: err, reload: true}
+			}
+		}
+	}
+	var cmd tea.Cmd
+	m.removeCredentialInput, cmd = m.removeCredentialInput.Update(message)
+	return m, cmd
+}
+
+func (m *Model) clearRemoveCredentialForm() {
+	m.removeCredentialInput.SetValue("")
+	m.removeCredentialInput.Blur()
+	m.removeCredential = false
+	m.removeCredentialID = ""
+	m.removeCredentialExpected = ""
+	m.removeCredentialKind = ""
+	m.removeCredentialAccountHint = ""
+	m.removeCredentialZoneIDs = nil
+	m.removeCredentialZoneNames = nil
+}
+
+func (m *Model) removeCredentialRoutesUnchanged() bool {
+	if len(m.removeCredentialZoneIDs) != len(m.removeCredentialZoneNames) {
+		return false
+	}
+	expected := make(map[string]string, len(m.removeCredentialZoneIDs))
+	for index, zoneID := range m.removeCredentialZoneIDs {
+		expected[zoneID] = m.removeCredentialZoneNames[index]
+	}
+	seen := 0
+	for _, zone := range m.zones {
+		if zone.PreferredCredentialID != m.removeCredentialID {
+			continue
+		}
+		name, ok := expected[zone.ID]
+		if !ok || name != zone.Name {
+			return false
+		}
+		seen++
+	}
+	return seen == len(expected)
+}
+
+func (m *Model) openPreferredCredentialForm() {
+	zone, ok := m.selectedZone()
+	if !ok {
+		return
+	}
+	newInput := func(placeholder string) textinput.Model {
+		input := textinput.New()
+		input.Prompt = ""
+		input.Placeholder = placeholder
+		input.SetWidth(54)
+		return input
+	}
+	m.preferCredentialInputs = []textinput.Model{
+		newInput("Credential ID or unique connection label"),
+		newInput("Type the exact zone name"),
+	}
+	m.preferCredentialInputs[0].Focus()
+	m.preferCredentialFocus = 0
+	m.preferZoneID = zone.ID
+	m.preferZoneExpectedName = zone.Name
+	m.preferZoneProvider = zone.Provider
+	m.preferZoneAccountID = zone.AccountID
+	m.preferOriginalCredentialID = zone.PreferredCredentialID
+	m.preferResolvedCredentialID = ""
+	m.preferResolvedCredentialLabel = ""
+	m.preferCredentialSelection = ""
+	m.preferCredential = true
+	m.err = nil
+}
+
+func (m *Model) updatePreferredCredentialForm(message tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := message.(tea.KeyPressMsg); ok {
+		switch key.String() {
+		case "esc":
+			m.clearPreferredCredentialForm()
+			return m, nil
+		case "tab", "down":
+			if m.preferCredentialFocus == 0 && !m.capturePreferredCredential() {
+				return m, nil
+			}
+			m.focusPreferredCredential(1)
+			return m, nil
+		case "shift+tab", "up":
+			if m.preferCredentialFocus == 0 && !m.capturePreferredCredential() {
+				return m, nil
+			}
+			m.focusPreferredCredential(-1)
+			return m, nil
+		case "enter":
+			if m.preferCredentialFocus < len(m.preferCredentialInputs)-1 {
+				if !m.capturePreferredCredential() {
+					return m, nil
+				}
+				m.focusPreferredCredential(1)
+				return m, nil
+			}
+			if m.mutationFormBlocked() {
+				return m, nil
+			}
+			zone, ok := m.zoneByID(m.preferZoneID)
+			if !ok || zone.Name != m.preferZoneExpectedName || zone.Provider != m.preferZoneProvider || zone.AccountID != m.preferZoneAccountID || zone.PreferredCredentialID != m.preferOriginalCredentialID {
+				m.err = errors.New("the selected zone or its route changed; cancel and select it again")
+				return m, nil
+			}
+			if m.preferCredentialInputs[1].Value() != m.preferZoneExpectedName {
+				m.err = fmt.Errorf("type %q exactly to confirm the routing change", m.preferZoneExpectedName)
+				return m, nil
+			}
+			if m.preferResolvedCredentialID == "" || strings.TrimSpace(m.preferCredentialInputs[0].Value()) != m.preferCredentialSelection {
+				m.err = errors.New("select the connection again before confirming")
+				return m, nil
+			}
+			credential, ok := m.credentialByID(m.preferResolvedCredentialID)
+			if !ok || credential.Label != m.preferResolvedCredentialLabel {
+				m.err = errors.New("the selected connection changed; select it again")
+				return m, nil
+			}
+			if _, err := validatePreferredCredential(credential, zone); err != nil {
+				m.err = err
+				return m, nil
+			}
+			zoneID := m.preferZoneID
+			credentialID := credential.ID
+			zoneName := m.preferZoneExpectedName
+			m.clearPreferredCredentialForm()
+			m.busy = true
+			return m, func() tea.Msg {
+				ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+				defer cancel()
+				_, err := m.backend.SetZonePreferredCredential(ctx, zoneID, credentialID)
+				return operationMsg{message: "Preferred connection updated for " + zoneName, err: err, reload: true}
+			}
+		}
+	}
+	var cmd tea.Cmd
+	m.preferCredentialInputs[m.preferCredentialFocus], cmd = m.preferCredentialInputs[m.preferCredentialFocus].Update(message)
+	if m.preferCredentialFocus == 0 {
+		m.preferResolvedCredentialID = ""
+		m.preferResolvedCredentialLabel = ""
+		m.preferCredentialSelection = ""
+	}
+	return m, cmd
+}
+
+func (m *Model) capturePreferredCredential() bool {
+	zone, ok := m.zoneByID(m.preferZoneID)
+	if !ok || zone.Name != m.preferZoneExpectedName || zone.Provider != m.preferZoneProvider || zone.AccountID != m.preferZoneAccountID || zone.PreferredCredentialID != m.preferOriginalCredentialID {
+		m.err = errors.New("the selected zone or its route changed; cancel and select it again")
+		return false
+	}
+	selection := strings.TrimSpace(m.preferCredentialInputs[0].Value())
+	credential, err := m.resolvePreferredCredential(selection, zone)
+	if err != nil {
+		m.err = err
+		return false
+	}
+	m.preferResolvedCredentialID = credential.ID
+	m.preferResolvedCredentialLabel = credential.Label
+	m.preferCredentialSelection = selection
+	m.err = nil
+	return true
+}
+
+func (m *Model) focusPreferredCredential(delta int) {
+	m.preferCredentialInputs[m.preferCredentialFocus].Blur()
+	m.preferCredentialFocus = (m.preferCredentialFocus + delta + len(m.preferCredentialInputs)) % len(m.preferCredentialInputs)
+	m.preferCredentialInputs[m.preferCredentialFocus].Focus()
+}
+
+func (m *Model) clearPreferredCredentialForm() {
+	for i := range m.preferCredentialInputs {
+		m.preferCredentialInputs[i].SetValue("")
+		m.preferCredentialInputs[i].Blur()
+	}
+	m.preferCredential = false
+	m.preferCredentialFocus = 0
+	m.preferZoneID = ""
+	m.preferZoneExpectedName = ""
+	m.preferZoneProvider = ""
+	m.preferZoneAccountID = ""
+	m.preferOriginalCredentialID = ""
+	m.preferResolvedCredentialID = ""
+	m.preferResolvedCredentialLabel = ""
+	m.preferCredentialSelection = ""
+}
+
+func (m *Model) resolvePreferredCredential(value string, zone domain.Zone) (domain.Credential, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return domain.Credential{}, errors.New("a credential ID or connection label is required")
+	}
+	for _, credential := range m.credentials {
+		if credential.ID == value {
+			return validatePreferredCredential(credential, zone)
+		}
+	}
+	matches := make([]domain.Credential, 0, 1)
+	for _, credential := range m.credentials {
+		if strings.EqualFold(strings.TrimSpace(credential.Label), value) {
+			matches = append(matches, credential)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return domain.Credential{}, fmt.Errorf("connection %q is not synchronized; use an ID shown in Accounts", value)
+	case 1:
+		return validatePreferredCredential(matches[0], zone)
+	default:
+		return domain.Credential{}, fmt.Errorf("connection label %q is ambiguous across %d credentials; use the credential ID", value, len(matches))
+	}
+}
+
+func validatePreferredCredential(credential domain.Credential, zone domain.Zone) (domain.Credential, error) {
+	if credential.Provider != zone.Provider {
+		return domain.Credential{}, fmt.Errorf("connection %q uses provider %q, not %q", credential.Label, credential.Provider, zone.Provider)
+	}
+	if credential.Status != domain.CredentialValid {
+		return domain.Credential{}, fmt.Errorf("connection %q is %s; synchronize or replace it before routing", credential.Label, credential.Status)
+	}
+	return credential, nil
+}
+
+func (m *Model) credentialByID(id string) (domain.Credential, bool) {
+	for _, credential := range m.credentials {
+		if credential.ID == id {
+			return credential, true
+		}
+	}
+	return domain.Credential{}, false
+}
+
+func (m *Model) mutationFormBlocked() bool {
+	switch {
+	case m.recoveryBlocked:
+		m.toast, m.toastAt = "Crash recovery must succeed before mutations are enabled", time.Now()
+	case m.busy:
+		m.toast, m.toastAt = "An operation is already running", time.Now()
+	case m.loading:
+		m.toast, m.toastAt = "Loading the latest zone state", time.Now()
+	default:
+		return false
+	}
+	return true
 }
 
 func (m *Model) openRecordForm(editing bool) {
@@ -1383,12 +1727,14 @@ func (m *Model) isMutationKey(key string) bool {
 		return true
 	case "a":
 		return m.screen == screenDashboard || m.screen == screenAccounts
+	case "p":
+		return m.screen == screenZones
 	case "n":
 		return m.screen == screenDNS || m.screen == screenCertificates
 	case "i", "x", "u":
 		return m.screen == screenCertificates
 	case "d":
-		return m.screen == screenDNS || m.screen == screenCertificates
+		return m.screen == screenAccounts || m.screen == screenDNS || m.screen == screenCertificates
 	case "e":
 		return m.screen == screenDNS
 	case "s", "m", "t", "v", "h":
@@ -1493,8 +1839,25 @@ func (m *Model) updateOverlay(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.openCredentialForm()
 			return m, textinput.Blink
 		}
-		m.busy = true
-		return m, syncCmd(m.backend)
+		switch selected - len(screens) {
+		case 1:
+			m.busy = true
+			return m, syncCmd(m.backend)
+		case 2:
+			if m.screen != screenAccounts || len(m.filteredCredentials()) == 0 {
+				m.toast, m.toastAt = "Select a connection in Accounts first", time.Now()
+				return m, nil
+			}
+			m.openRemoveCredentialForm()
+			return m, textinput.Blink
+		case 3:
+			if m.screen != screenZones || len(m.filteredZones()) == 0 {
+				m.toast, m.toastAt = "Select a zone in Zones first", time.Now()
+				return m, nil
+			}
+			m.openPreferredCredentialForm()
+			return m, textinput.Blink
+		}
 	}
 	return m, nil
 }
@@ -1737,6 +2100,12 @@ func (m *Model) resizeInputs() {
 	for i := range m.credentialInputs {
 		m.credentialInputs[i].SetWidth(width)
 	}
+	if m.removeCredential {
+		m.removeCredentialInput.SetWidth(width)
+	}
+	for i := range m.preferCredentialInputs {
+		m.preferCredentialInputs[i].SetWidth(width)
+	}
 	for i := range m.recordInputs {
 		m.recordInputs[i].SetWidth(width)
 	}
@@ -1778,9 +2147,14 @@ func max(a, b int) int {
 }
 
 func paletteCommands() []string {
-	result := make([]string, 0, len(screens)+2)
+	result := make([]string, 0, len(screens)+4)
 	for _, item := range screens {
 		result = append(result, "Go to "+item.name)
 	}
-	return append(result, "Add Cloudflare account", "Synchronize everything")
+	return append(result,
+		"Add Cloudflare account",
+		"Synchronize everything",
+		"Remove selected Cloudflare connection/token",
+		"Set selected zone preferred connection",
+	)
 }

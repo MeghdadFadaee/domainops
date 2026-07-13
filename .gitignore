@@ -7,6 +7,16 @@
 *.out
 .DS_Store
 .idea/
+.vscode/
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+vault-password
+vault-password.txt

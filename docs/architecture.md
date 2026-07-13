@@ -32,9 +32,13 @@ The provider package defines focused capabilities:
 - `DNS01Solver`
 - `EdgeTLSService`
 
-Cloudflare is the first adapter. Its wire types do not escape the adapter. Unknown DNS record JSON is retained so new provider fields remain visible even before DomainOps adds an editor for them.
+Credential verification, zone inventory, single-record DNS CRUD, and DNS-01 form the mandatory provider contract. DNS batching, ambiguous DNS-01 reconciliation, and edge TLS are optional capabilities discovered at runtime; unsupported operations return typed capability errors instead of forcing every future adapter to imitate Cloudflare.
+
+Cloudflare is the first adapter. Its wire types do not escape the adapter. Unknown DNS record JSON is retained so new provider fields remain visible even before DomainOps adds an editor for them. ACME presentation, cleanup, and crash reconciliation route through the provider identity bound to the exact credential, so remote zone-ID collisions cannot redirect a delayed challenge operation to another adapter.
 
 Credential identities and remote accounts are separate. One user token may expose several Cloudflare accounts, while an account token belongs to one account. A zone stores an explicit preferred credential; ACME and DNS writes never silently switch credentials.
+
+Operator-facing removal and routing retain immutable local credential/zone IDs across confirmation and reload. Removing a local connection can reassign preferred routes only after recent per-zone write evidence plus a fresh DNS read through the replacement. Explicit routing verifies DNS read immediately; write authority remains visibly unproven until Cloudflare accepts a real mutation.
 
 After a successful full sync, a zone no longer visible to its preferred credential is retained as cached history but marked unknown and detached from that stale preference. DNS-read authority is also stored per credential and zone. An authoritative 401/403 on a later zone read atomically removes that evidence and detaches only the denied route, while transient transport, rate-limit, and server failures preserve the last successful observation. A later credential that rediscovers the zone can restore routing without trapping credential removal behind an unreachable zone.
 

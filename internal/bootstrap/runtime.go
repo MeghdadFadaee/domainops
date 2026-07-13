@@ -76,7 +76,7 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 	application.RegisterProvider("cloudflare", cloudflareClient)
 
 	httpClient := &http.Client{Timeout: 45 * time.Second}
-	engine := certificates.NewEngine(repository, vault, cloudflareClient, application.ResolveDNS01,
+	engine := certificates.NewEngine(repository, vault, application, application.ResolveDNS01,
 		certificates.WithACMEHTTPClient(httpClient, "DomainOps/1"),
 		certificates.WithPreflight(application.CertificatePreflight),
 		certificates.WithDNSWriteObserver(func(observeCtx context.Context, credentialID, providerZoneID string) error {
@@ -97,7 +97,7 @@ func Open(ctx context.Context, options Options) (*Runtime, error) {
 		recoveryErr := errors.Join(
 			certificates.RecoverACMEAccountCommitIntents(cleanupCtx, repository, vault),
 			certificates.RecoverCertificateCommitIntents(cleanupCtx, repository, vault, paths.Certificates),
-			certificates.CleanupOpenChallenges(cleanupCtx, repository, cloudflareClient, application.ResolveDNS01, application.ResolveCredential),
+			certificates.CleanupOpenChallenges(cleanupCtx, repository, application, application.ResolveDNS01, application.ResolveCredential),
 			certificateService.RepairManagedCurrentLinks(cleanupCtx),
 		)
 		return reconcileJobsAfterRecovery(recoveryErr, func() error {
@@ -148,7 +148,7 @@ func (r *Runtime) Recover(ctx context.Context) error {
 	recoveryErr := errors.Join(
 		certificates.RecoverACMEAccountCommitIntents(ctx, r.Repository, r.Vault),
 		certificates.RecoverCertificateCommitIntents(ctx, r.Repository, r.Vault, r.Paths.Certificates),
-		certificates.CleanupOpenChallenges(ctx, r.Repository, r.Cloudflare, r.Application.ResolveDNS01, r.Application.ResolveCredential),
+		certificates.CleanupOpenChallenges(ctx, r.Repository, r.Application, r.Application.ResolveDNS01, r.Application.ResolveCredential),
 		r.Certificates.RepairManagedCurrentLinks(ctx),
 	)
 	return reconcileJobsAfterRecovery(recoveryErr, func() error {

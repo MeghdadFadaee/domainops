@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/MeghdadFadaee/domainops/internal/app"
 	"github.com/MeghdadFadaee/domainops/internal/domain"
@@ -713,6 +714,254 @@ func TestLoadingCommandPaletteRejectsMutationEntries(t *testing.T) {
 	}
 }
 
+func TestRemoveCredentialCapturesExactIDAndDisclosesAffectedRoutes(t *testing.T) {
+	backend := &fakeBackend{}
+	model := New(backend, Options{})
+	model.screen = screenAccounts
+	model.credentials = []domain.Credential{
+		{ID: "credential-a", Label: "Primary", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid},
+		{ID: "credential-b", Label: "Retiring", Provider: domain.ProviderCloudflare, Kind: domain.CredentialAccountToken, AccountHint: "account-main", Status: domain.CredentialValid},
+	}
+	model.zones = []domain.Zone{
+		{ID: "zone-a", Name: "example.com", PreferredCredentialID: "credential-b"},
+		{ID: "zone-b", Name: "example.net", PreferredCredentialID: "credential-b"},
+	}
+	model.rowOffset = 1
+
+	_, blink := model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	if blink == nil || !model.removeCredential || model.removeCredentialID != "credential-b" || model.removeCredentialInput.Value() != "" {
+		t.Fatalf("remove form = open:%v id:%q input:%q cmd:%v", model.removeCredential, model.removeCredentialID, model.removeCredentialInput.Value(), blink != nil)
+	}
+	view := model.View().Content
+	for _, expected := range []string{"Retiring", "credential-b", "account_token", "account-main", "2 preferred zone route", "example.com", "example.net", "reassigned"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("remove form does not disclose %q: %q", expected, view)
+		}
+	}
+
+	// A refresh/reorder after opening must not redirect removal to the new row.
+	_, _ = model.Update(loadMsg{credentials: []domain.Credential{
+		{ID: "credential-b", Label: "Retiring", Provider: domain.ProviderCloudflare, Kind: domain.CredentialAccountToken, AccountHint: "account-main", Status: domain.CredentialValid},
+		{ID: "credential-a", Label: "Primary", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid},
+	}, zones: model.zones})
+	model.removeCredentialInput.SetValue("Retiring")
+	_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil || model.removeCredential || !model.busy {
+		t.Fatalf("confirmed removal = cmd:%v open:%v busy:%v", cmd != nil, model.removeCredential, model.busy)
+	}
+	message, ok := cmd().(operationMsg)
+	if !ok || !message.reload || message.err != nil {
+		t.Fatalf("remove result = %#v", message)
+	}
+	if len(backend.deletedCredentials) != 1 || backend.deletedCredentials[0] != "credential-b" {
+		t.Fatalf("deleted credential IDs = %v", backend.deletedCredentials)
+	}
+}
+
+func TestRemoveCredentialCancellationAndStaleConnectionAreSafe(t *testing.T) {
+	backend := &fakeBackend{}
+	model := New(backend, Options{})
+	model.screen = screenAccounts
+	model.credentials = []domain.Credential{{ID: "credential", Label: "Production", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid}}
+
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	model.removeCredentialInput.SetValue("Production")
+	_, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if model.removeCredential || model.removeCredentialID != "" || model.removeCredentialExpected != "" || model.removeCredentialInput.Value() != "" {
+		t.Fatalf("cancel retained remove state: open=%v id=%q label=%q input=%q", model.removeCredential, model.removeCredentialID, model.removeCredentialExpected, model.removeCredentialInput.Value())
+	}
+
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	model.removeCredentialInput.SetValue("Production")
+	model.credentials = nil
+	_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd != nil || model.err == nil || len(backend.deletedCredentials) != 0 {
+		t.Fatalf("stale remove mutated: cmd=%v err=%v calls=%v", cmd != nil, model.err, backend.deletedCredentials)
+	}
+}
+
+func TestRemoveCredentialRejectsChangedAffectedRoutes(t *testing.T) {
+	backend := &fakeBackend{}
+	model := New(backend, Options{})
+	model.screen = screenAccounts
+	model.credentials = []domain.Credential{{ID: "credential", Label: "Production", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid}}
+	model.zones = []domain.Zone{{ID: "zone-a", Name: "example.com", PreferredCredentialID: "credential"}}
+
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	model.removeCredentialInput.SetValue("Production")
+	model.zones = append(model.zones, domain.Zone{ID: "zone-b", Name: "example.net", PreferredCredentialID: "credential"})
+	_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd != nil || model.err == nil || !strings.Contains(model.err.Error(), "affected zone routes changed") || len(backend.deletedCredentials) != 0 {
+		t.Fatalf("changed route disclosure mutated: cmd=%v err=%v calls=%v", cmd != nil, model.err, backend.deletedCredentials)
+	}
+}
+
+func TestRemoveCredentialSurfacesFailClosedReplacementError(t *testing.T) {
+	backend := &fakeBackend{deleteCredentialErr: errors.New("zone example.com has no proven replacement")}
+	model := New(backend, Options{})
+	model.screen = screenAccounts
+	model.credentials = []domain.Credential{{ID: "credential", Label: "Production", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid}}
+
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"})
+	model.removeCredentialInput.SetValue("Production")
+	_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("confirmed removal did not call backend")
+	}
+	_, reload := model.Update(cmd())
+	if reload == nil || model.err == nil || !strings.Contains(model.err.Error(), "no proven replacement") {
+		t.Fatalf("replacement failure = reload:%v err:%v", reload != nil, model.err)
+	}
+}
+
+func TestPreferredCredentialRejectsAmbiguousLabelAndInvalidCandidates(t *testing.T) {
+	model := New(&fakeBackend{}, Options{})
+	zone := domain.Zone{ID: "zone", Name: "example.com", Provider: domain.ProviderCloudflare}
+	model.screen = screenZones
+	model.zones = []domain.Zone{zone}
+	model.credentials = []domain.Credential{
+		{ID: "credential-a", Label: "Production", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid},
+		{ID: "credential-b", Label: "production", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid},
+		{ID: "credential-invalid", Label: "Invalid", Provider: domain.ProviderCloudflare, Status: domain.CredentialInvalid},
+		{ID: "credential-other", Label: "Other", Provider: "other", Status: domain.CredentialValid},
+	}
+
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	if model.preferCredentialInputs[0].Value() != "" || model.preferCredentialInputs[1].Value() != "" {
+		t.Fatalf("preference confirmation was prefilled: %#v", model.preferCredentialInputs)
+	}
+	model.preferCredentialInputs[0].SetValue("Production")
+	_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd != nil || model.preferCredentialFocus != 0 || model.err == nil || !strings.Contains(model.err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous label = cmd:%v focus:%d err:%v", cmd != nil, model.preferCredentialFocus, model.err)
+	}
+	for _, test := range []struct {
+		value string
+		want  string
+	}{{"credential-invalid", "invalid"}, {"credential-other", "provider"}} {
+		model.preferCredentialInputs[0].SetValue(test.value)
+		_, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		if model.err == nil || !strings.Contains(model.err.Error(), test.want) {
+			t.Fatalf("selector %q error = %v, want %q", test.value, model.err, test.want)
+		}
+	}
+}
+
+func TestPreferredCredentialCapturesIDAcrossRefreshAndCallsExactZone(t *testing.T) {
+	backend := &fakeBackend{}
+	model := New(backend, Options{})
+	model.screen = screenZones
+	model.zones = []domain.Zone{{ID: "zone-id", Name: "example.com", Provider: domain.ProviderCloudflare, PreferredCredentialID: "credential-old"}}
+	model.credentials = []domain.Credential{
+		{ID: "credential-old", Label: "Old", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid},
+		{ID: "credential-selected", Label: "Replacement", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid},
+	}
+
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	model.preferCredentialInputs[0].SetValue("Replacement")
+	_, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if model.preferCredentialFocus != 1 || model.preferResolvedCredentialID != "credential-selected" {
+		t.Fatalf("captured credential = focus:%d id:%q err:%v", model.preferCredentialFocus, model.preferResolvedCredentialID, model.err)
+	}
+
+	// The label becomes ambiguous after capture. Final confirmation must retain
+	// the immutable ID instead of resolving the label to a different row.
+	_, _ = model.Update(loadMsg{zones: model.zones, credentials: []domain.Credential{
+		{ID: "credential-new", Label: "Replacement", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid},
+		{ID: "credential-selected", Label: "Replacement", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid},
+		{ID: "credential-old", Label: "Old", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid},
+	}})
+	model.preferCredentialInputs[1].SetValue("example.com")
+	_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil || model.preferCredential || !model.busy {
+		t.Fatalf("preference submit = cmd:%v open:%v busy:%v err:%v", cmd != nil, model.preferCredential, model.busy, model.err)
+	}
+	message, ok := cmd().(operationMsg)
+	if !ok || !message.reload || message.err != nil {
+		t.Fatalf("preference result = %#v", message)
+	}
+	if fmt.Sprint(backend.preferredZones) != "[zone-id]" || fmt.Sprint(backend.preferredCredentials) != "[credential-selected]" {
+		t.Fatalf("preferred calls = zones:%v credentials:%v", backend.preferredZones, backend.preferredCredentials)
+	}
+}
+
+func TestPreferredCredentialFormFitsMinimumTerminalAndShowsRoutingIdentity(t *testing.T) {
+	model := New(&fakeBackend{}, Options{})
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 64, Height: 18})
+	model.screen = screenZones
+	model.accounts = []domain.RemoteAccount{{ID: "account-id", Name: "Primary"}}
+	model.zones = []domain.Zone{{ID: "zone-id", Name: "example.com", Provider: domain.ProviderCloudflare, AccountID: "account-id", PreferredCredentialID: "credential-current"}}
+	model.credentials = []domain.Credential{
+		{ID: "credential-current", Label: "Current", Provider: domain.ProviderCloudflare, Kind: domain.CredentialUserToken, Status: domain.CredentialValid, Capabilities: []string{"dns:read", "dns:write"}},
+		{ID: "credential-next", Label: "Next", Provider: domain.ProviderCloudflare, Kind: domain.CredentialAccountToken, AccountHint: "account-id", Status: domain.CredentialValid, Capabilities: []string{"dns:read"}},
+	}
+
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	view := model.View().Content
+	if height := lipgloss.Height(view); height > 18 {
+		t.Fatalf("minimum-terminal preference modal height = %d\n%s", height, view)
+	}
+	for _, expected := range []string{"example.com", "zone-id", "Primary", "account-id", "credential-current", "Current", "current"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("preference form does not show %q: %q", expected, view)
+		}
+	}
+}
+
+func TestPreferredCredentialCancellationAndStaleRouteAreSafe(t *testing.T) {
+	backend := &fakeBackend{}
+	model := New(backend, Options{})
+	model.screen = screenZones
+	model.zones = []domain.Zone{{ID: "zone", Name: "example.com", Provider: domain.ProviderCloudflare, PreferredCredentialID: "old"}}
+	model.credentials = []domain.Credential{{ID: "new", Label: "New", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid}}
+
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	model.preferCredentialInputs[0].SetValue("new")
+	_, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if model.preferCredential || model.preferZoneID != "" || model.preferResolvedCredentialID != "" || len(model.preferCredentialInputs) != 2 || model.preferCredentialInputs[0].Value() != "" {
+		t.Fatalf("cancel retained preference state: %#v", model)
+	}
+
+	_, _ = model.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	model.preferCredentialInputs[0].SetValue("new")
+	_, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	model.zones[0].PreferredCredentialID = "changed-elsewhere"
+	model.preferCredentialInputs[1].SetValue("example.com")
+	_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd != nil || model.err == nil || !strings.Contains(model.err.Error(), "route changed") || len(backend.preferredZones) != 0 {
+		t.Fatalf("stale route mutated: cmd=%v err=%v calls=%v", cmd != nil, model.err, backend.preferredZones)
+	}
+}
+
+func TestAccountAndZoneMutationsRespectRecoveryBusyAndLoadingGuards(t *testing.T) {
+	tests := []struct {
+		name    string
+		screen  screen
+		key     rune
+		blocked func(*Model)
+	}{
+		{"remove recovery", screenAccounts, 'd', func(m *Model) { m.recoveryBlocked = true }},
+		{"remove busy", screenAccounts, 'd', func(m *Model) { m.busy = true }},
+		{"remove loading", screenAccounts, 'd', func(m *Model) { m.loading = true }},
+		{"prefer recovery", screenZones, 'p', func(m *Model) { m.recoveryBlocked = true }},
+		{"prefer busy", screenZones, 'p', func(m *Model) { m.busy = true }},
+		{"prefer loading", screenZones, 'p', func(m *Model) { m.loading = true }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			model := New(&fakeBackend{}, Options{})
+			model.screen = test.screen
+			model.credentials = []domain.Credential{{ID: "credential", Label: "Production", Provider: domain.ProviderCloudflare, Status: domain.CredentialValid}}
+			model.zones = []domain.Zone{{ID: "zone", Name: "example.com", Provider: domain.ProviderCloudflare}}
+			test.blocked(model)
+			_, cmd := model.Update(tea.KeyPressMsg{Code: test.key, Text: string(test.key)})
+			if cmd != nil || model.removeCredential || model.preferCredential || model.toast == "" {
+				t.Fatalf("blocked mutation = cmd:%v remove:%v prefer:%v toast:%q", cmd != nil, model.removeCredential, model.preferCredential, model.toast)
+			}
+		})
+	}
+}
+
 func TestFirstRunVaultRequiresConfirmation(t *testing.T) {
 	backend := &fakeBackend{locked: true}
 	model := New(backend, Options{FirstRun: true})
@@ -754,21 +1003,26 @@ func TestExistingVaultAcceptsLegacyShortPassword(t *testing.T) {
 }
 
 type fakeBackend struct {
-	locked              bool
-	unlockCalls         int
-	unlockNilCalls      int
-	unlockErr           error
-	dnsZones            []string
-	zones               []domain.Zone
-	deleteCalls         int
-	tlsSettings         map[string]domain.EdgeTLSSettings
-	tlsErr              error
-	tlsZones            []string
-	updateTLSZones      []string
-	updateTLSDrafts     []domain.EdgeTLSSettings
-	issueRequests       []app.IssueZonesRequest
-	revokeLineages      []string
-	revokeConfirmations []string
+	locked                 bool
+	unlockCalls            int
+	unlockNilCalls         int
+	unlockErr              error
+	dnsZones               []string
+	zones                  []domain.Zone
+	deleteCalls            int
+	deletedCredentials     []string
+	deleteCredentialErr    error
+	preferredZones         []string
+	preferredCredentials   []string
+	preferredCredentialErr error
+	tlsSettings            map[string]domain.EdgeTLSSettings
+	tlsErr                 error
+	tlsZones               []string
+	updateTLSZones         []string
+	updateTLSDrafts        []domain.EdgeTLSSettings
+	issueRequests          []app.IssueZonesRequest
+	revokeLineages         []string
+	revokeConfirmations    []string
 }
 
 func (f *fakeBackend) VaultLocked() bool { return f.locked }
@@ -803,6 +1057,15 @@ func (f *fakeBackend) Jobs(context.Context, int) ([]domain.Job, error)         {
 func (f *fakeBackend) Audit(context.Context, int) ([]domain.AuditEvent, error) { return nil, nil }
 func (f *fakeBackend) AddCloudflareCredential(context.Context, app.AddCredentialInput) (domain.Credential, error) {
 	return domain.Credential{}, nil
+}
+func (f *fakeBackend) DeleteCredential(_ context.Context, credentialID string) error {
+	f.deletedCredentials = append(f.deletedCredentials, credentialID)
+	return f.deleteCredentialErr
+}
+func (f *fakeBackend) SetZonePreferredCredential(_ context.Context, zoneID, credentialID string) (domain.Zone, error) {
+	f.preferredZones = append(f.preferredZones, zoneID)
+	f.preferredCredentials = append(f.preferredCredentials, credentialID)
+	return domain.Zone{ID: zoneID, PreferredCredentialID: credentialID}, f.preferredCredentialErr
 }
 func (f *fakeBackend) SyncAll(context.Context) ([]domain.Job, error) { return nil, nil }
 func (f *fakeBackend) CreateDNSRecord(context.Context, string, domain.DNSRecord) (domain.DNSRecord, error) {

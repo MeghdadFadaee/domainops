@@ -22,6 +22,8 @@ Global API Keys are rejected. Use least-privilege API tokens scoped to the neces
 
 Tokens are masked during entry. Headless use accepts a token file or vault-password file only when it is a regular file with no group/other permission bits. Literal secret flags are intentionally unavailable.
 
+TUI connection removal and zone routing bind confirmation to immutable local IDs rather than filtered row positions or non-unique labels. Removal shows affected routes, uses a bounded long-running verification window, and refuses to remove a credential when any preferred zone lacks a live-readable replacement with recent observed write success. Explicit preference changes live-probe DNS read access and label write authority as unproven until an actual provider mutation succeeds.
+
 ## ACME safety
 
 - Staging is the default issuance environment.

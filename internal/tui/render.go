@@ -29,6 +29,12 @@ func (m *Model) render() string {
 	if m.addCredential {
 		return m.renderCredentialForm()
 	}
+	if m.removeCredential {
+		return m.renderRemoveCredentialForm()
+	}
+	if m.preferCredential {
+		return m.renderPreferredCredentialForm()
+	}
 	if m.editRecord {
 		return m.renderRecordForm()
 	}
@@ -87,6 +93,12 @@ func (m *Model) renderHeader() string {
 func (m *Model) renderFooter() string {
 	left := m.theme.key.Render("?") + " help  " + m.theme.key.Render("Ctrl+K") + " commands  " + m.theme.key.Render("/") + " filter"
 	right := m.theme.key.Render("r") + " sync  " + m.theme.key.Render("q") + " quit"
+	switch m.screen {
+	case screenAccounts:
+		right = m.theme.key.Render("a") + " add  " + m.theme.key.Render("d") + " remove  " + m.theme.key.Render("q") + " quit"
+	case screenZones:
+		right = m.theme.key.Render("p") + " set route  " + m.theme.key.Render("Enter") + " DNS  " + m.theme.key.Render("q") + " quit"
+	}
 	if m.recoveryBlocked {
 		right = m.theme.key.Render("R") + " retry recovery  " + m.theme.key.Render("q") + " quit"
 	}
@@ -221,7 +233,7 @@ func (m *Model) renderAccounts(width, height int) string {
 	if len(values) == 0 {
 		return m.emptyState("No Cloudflare accounts", "Press a to add a scoped API token.", width, height)
 	}
-	header := row(width, []cell{{"LABEL", 28}, {"TOKEN", 18}, {"STATUS", 14}, {"CAPABILITIES", 40}})
+	header := row(width, []cell{{"LABEL", 24}, {"CREDENTIAL ID", 28}, {"TOKEN", 16}, {"STATUS", 12}, {"CAPABILITIES", 30}})
 	rows := []string{m.theme.mutedText.Render(header)}
 	reserved := 0
 	if len(m.accounts) > 0 {
@@ -232,7 +244,7 @@ func (m *Model) renderAccounts(width, height int) string {
 	for i := start; i < len(values) && i < start+limit; i++ {
 		value := values[i]
 		status := string(value.Status)
-		line := row(width, []cell{{value.Label, 28}, {string(value.Kind), 18}, {status, 14}, {strings.Join(value.Capabilities, ", "), 40}})
+		line := row(width, []cell{{value.Label, 24}, {value.ID, 28}, {string(value.Kind), 16}, {status, 12}, {strings.Join(value.Capabilities, ", "), 30}})
 		if i == m.rowOffset {
 			line = m.theme.selected.Width(width - 2).Render(line)
 		}
@@ -245,7 +257,7 @@ func (m *Model) renderAccounts(width, height int) string {
 		}
 		rows = append(rows, "", m.theme.panelTitle.Render(fmt.Sprintf("REMOTE ACCOUNTS · %d", len(m.accounts))), m.theme.mutedText.Render(truncate(strings.Join(names, "  ·  "), max(1, width-6))))
 	}
-	return m.panel("CLOUDFLARE CONNECTIONS  ·  a add  ·  r sync", strings.Join(rows, "\n"), width, height)
+	return m.panel("CLOUDFLARE CONNECTIONS  ·  a add  ·  d safely remove  ·  r sync", strings.Join(rows, "\n"), width, height)
 }
 
 func (m *Model) renderZones(width, height int) string {
@@ -265,7 +277,7 @@ func (m *Model) renderZones(width, height int) string {
 		}
 		rows = append(rows, line)
 	}
-	return m.panel("ZONES  ·  Enter open DNS  ·  j/k select", strings.Join(rows, "\n"), width, height)
+	return m.panel("ZONES  ·  Enter open DNS  ·  p set preferred connection  ·  j/k select", strings.Join(rows, "\n"), width, height)
 }
 
 func (m *Model) accountLabel(id string) string {
@@ -527,6 +539,122 @@ func (m *Model) renderCredentialForm() string {
 	return m.theme.app.Width(m.width).Height(m.height).Render(lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal))
 }
 
+func (m *Model) renderRemoveCredentialForm() string {
+	contentWidth := max(20, min(70, m.width-16))
+	affected := "No currently preferred zone routes use this connection."
+	if len(m.removeCredentialZoneIDs) > 0 {
+		names := m.removeCredentialZoneNames
+		shown := names
+		if len(shown) > 4 {
+			shown = shown[:4]
+		}
+		affected = fmt.Sprintf("%d preferred zone route(s): %s", len(names), strings.Join(shown, ", "))
+		if len(names) > len(shown) {
+			affected += fmt.Sprintf(" … and %d more", len(names)-len(shown))
+		}
+	}
+	hint := m.removeCredentialAccountHint
+	if hint == "" {
+		hint = "all discovered accounts"
+	}
+	lines := []string{
+		m.theme.brand.Render("REMOVE CLOUDFLARE CONNECTION / TOKEN"),
+		m.theme.mutedText.Render(truncate("Connection: "+m.removeCredentialExpected+" · "+m.removeCredentialID, contentWidth)),
+		m.theme.mutedText.Render(truncate(fmt.Sprintf("Token: %s · account scope: %s", m.removeCredentialKind, hint), contentWidth)),
+		m.theme.mutedText.Render(truncate(affected, contentWidth)),
+		m.theme.statusWarn.Render("Routes may be reassigned after live verification."),
+		m.theme.statusWarn.Render("Fails closed unless every route has a proven replacement."),
+		m.theme.panelTitle.Render("Exact connection label"),
+		m.removeCredentialInput.View(),
+	}
+	if m.err != nil {
+		lines = append(lines, m.theme.statusBad.Render(truncate("! "+m.err.Error(), contentWidth)))
+	}
+	lines = append(lines, m.theme.mutedText.Render("Enter to remove · Esc to cancel"))
+	modal := m.theme.modal.Width(min(78, m.width-8)).Render(strings.Join(lines, "\n"))
+	return m.theme.app.Width(m.width).Height(m.height).Render(lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal))
+}
+
+func (m *Model) renderPreferredCredentialForm() string {
+	contentWidth := max(20, m.width-16)
+	current := "automatic / none"
+	if m.preferOriginalCredentialID != "" {
+		current = m.credentialLabel(m.preferOriginalCredentialID) + " · " + m.preferOriginalCredentialID
+	}
+	account := m.accountLabel(m.preferZoneAccountID)
+	if account == "" {
+		account = "unknown"
+	}
+	selectorLabel := m.theme.mutedText.Render("Credential ID or unique label")
+	confirmLabel := m.theme.mutedText.Render("Confirm exact zone name")
+	if m.preferCredentialFocus == 0 {
+		selectorLabel = m.theme.panelTitle.Render("Credential ID or unique label")
+	} else {
+		confirmLabel = m.theme.panelTitle.Render("Confirm exact zone name")
+	}
+	lines := []string{
+		m.theme.brand.Render("SET PREFERRED ZONE CONNECTION"),
+		m.theme.mutedText.Render(truncate("Zone: "+m.preferZoneExpectedName+" · "+m.preferZoneID, contentWidth)),
+		m.theme.mutedText.Render(truncate("Account: "+account+" · "+m.preferZoneAccountID, contentWidth)),
+		m.theme.mutedText.Render(truncate("Current route: "+current, contentWidth)),
+		selectorLabel,
+		m.preferCredentialInputs[0].View(),
+		confirmLabel,
+		m.preferCredentialInputs[1].View(),
+		m.theme.mutedText.Render("Connections · DNS read verified on apply:"),
+	}
+	validCandidates := 0
+	for _, credential := range m.credentials {
+		if credential.Provider == m.preferZoneProvider && credential.Status == domain.CredentialValid {
+			validCandidates++
+		}
+	}
+	candidateLimit := max(1, min(6, (m.height-16)/2))
+	shown := 0
+	for _, credential := range m.credentials {
+		if credential.Provider != m.preferZoneProvider || credential.Status != domain.CredentialValid {
+			continue
+		}
+		marker := " "
+		if credential.ID == m.preferOriginalCredentialID {
+			marker = "*"
+		}
+		hint := credential.AccountHint
+		if hint == "" {
+			hint = "all discovered accounts"
+		}
+		writeState := "dns:write observed before"
+		if !containsString(credential.Capabilities, "dns:write") {
+			writeState = "WRITE UNPROVEN"
+		}
+		labelWidth := max(1, contentWidth-len(credential.ID)-5)
+		candidate := fmt.Sprintf("%s %s · %s", marker, credential.ID, truncate(credential.Label, labelWidth))
+		details := fmt.Sprintf("  %s · %s · %s · %s", writeState, credential.Kind, hint, strings.Join(credential.Capabilities, ","))
+		lines = append(lines, m.theme.mutedText.Render(truncate(candidate, contentWidth)))
+		if writeState == "WRITE UNPROVEN" {
+			lines = append(lines, m.theme.statusWarn.Render(truncate(details, contentWidth)))
+		} else {
+			lines = append(lines, m.theme.mutedText.Render(truncate(details, contentWidth)))
+		}
+		shown++
+		if shown == candidateLimit {
+			break
+		}
+	}
+	if shown == 0 {
+		lines = append(lines, m.theme.statusWarn.Render("  No valid synchronized connection matches this zone provider."))
+	} else if validCandidates > shown {
+		lines = append(lines, m.theme.mutedText.Render(truncate(fmt.Sprintf("  … and %d more; full IDs are visible in Accounts", validCandidates-shown), contentWidth)))
+	}
+	lines = append(lines, m.theme.mutedText.Render("* current · write proven only by a real mutation"))
+	if m.err != nil {
+		lines = append(lines, m.theme.statusBad.Render(truncate("! "+m.err.Error(), contentWidth)))
+	}
+	lines = append(lines, m.theme.mutedText.Render("Tab move · Enter verify/apply · Esc cancel"))
+	modal := m.theme.modal.Width(min(84, m.width-8)).Render(strings.Join(lines, "\n"))
+	return m.theme.app.Width(m.width).Height(m.height).Render(lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal))
+}
+
 func (m *Model) renderRecordForm() string {
 	labels := []string{"Record type", "Name", "Content", "TTL", "Priority"}
 	title := "CREATE DNS RECORD"
@@ -661,6 +789,7 @@ func (m *Model) renderHelp() string {
 		m.theme.key.Render("1…7") + "  Navigate sections", m.theme.key.Render("j / k") + "  Move selection",
 		m.theme.key.Render("/") + "  Filter current view", m.theme.key.Render("Ctrl+K") + "  Command palette",
 		m.theme.key.Render("r") + "  Synchronize", m.theme.key.Render("a") + "  Add Cloudflare connection",
+		m.theme.key.Render("d") + "  Safely remove selected connection (Accounts)", m.theme.key.Render("p") + "  Set preferred zone connection (Zones)",
 		m.theme.key.Render("n / e / d") + "  New, edit, delete DNS record", m.theme.key.Render("?") + "  Close this help",
 		m.theme.key.Render("n / u / i / x / d") + "  Issue, renew due, import, export, revoke certificate",
 		"", m.theme.mutedText.Render("All operations are keyboard-accessible and safe over SSH."),

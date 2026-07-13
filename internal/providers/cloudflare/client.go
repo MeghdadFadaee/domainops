@@ -40,7 +40,8 @@ type Options struct {
 	Now        func() time.Time
 }
 
-// Client implements provider.CloudProvider.
+// Client implements the mandatory provider contract and Cloudflare's optional
+// batch, DNS-01 recovery, and edge-TLS capabilities.
 type Client struct {
 	baseURL    string
 	httpClient HTTPDoer
@@ -48,7 +49,12 @@ type Client struct {
 	now        func() time.Time
 }
 
-var _ provider.CloudProvider = (*Client)(nil)
+var (
+	_ provider.Provider        = (*Client)(nil)
+	_ provider.DNSBatchService = (*Client)(nil)
+	_ provider.DNS01Reconciler = (*Client)(nil)
+	_ provider.EdgeTLSService  = (*Client)(nil)
+)
 
 // New returns a production Cloudflare client.
 func New() *Client {

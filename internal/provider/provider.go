@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/MeghdadFadaee/domainops/internal/domain"
 )
@@ -38,6 +39,10 @@ func AccessFailureIsAuthoritative(err error) bool {
 }
 
 type Auth struct {
+	// Provider is the stable registry identity used to route this credential.
+	// It travels with the secret so delayed DNS-01 cleanup cannot be redirected
+	// to a different provider that happens to use the same remote zone ID.
+	Provider     string
 	CredentialID string
 	Token        string
 	Kind         domain.CredentialKind
@@ -118,11 +123,40 @@ type EdgeTLSService interface {
 	ListEdgeCertificates(context.Context, Auth, string, PageRequest) ([]domain.EdgeCertificate, error)
 }
 
-type CloudProvider interface {
+// Provider is the mandatory provider contract. DNS batching and edge TLS are
+// deliberately optional: a provider with safe single-record DNS operations
+// and DNS-01 support can be registered without pretending to implement them.
+type Provider interface {
 	CredentialVerifier
 	ZoneInventory
 	DNSRecordService
-	DNSBatchService
 	DNS01Solver
+}
+
+// CloudProvider retains the original all-capabilities contract for source
+// compatibility. New registrations should depend on Provider and discover
+// these optional capabilities with interface assertions.
+type CloudProvider interface {
+	Provider
+	DNSBatchService
 	EdgeTLSService
+}
+
+var ErrCapabilityUnsupported = errors.New("provider capability is not supported")
+
+// UnsupportedCapabilityError identifies the exact optional feature and
+// provider which cannot satisfy an operation.
+type UnsupportedCapabilityError struct {
+	Provider   string
+	Capability string
+}
+
+func (e *UnsupportedCapabilityError) Error() string {
+	return fmt.Sprintf("provider %q does not support %s", e.Provider, e.Capability)
+}
+
+func (e *UnsupportedCapabilityError) Unwrap() error { return ErrCapabilityUnsupported }
+
+func Unsupported(providerName, capability string) error {
+	return &UnsupportedCapabilityError{Provider: providerName, Capability: capability}
 }

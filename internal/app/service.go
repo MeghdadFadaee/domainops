@@ -91,14 +91,15 @@ type DNSBatchResult struct {
 type plannedDNSBatch struct {
 	plan  DNSBatchPlan
 	zone  domain.Zone
-	cloud provider.CloudProvider
+	cloud provider.Provider
+	batch provider.DNSBatchService
 	auth  provider.Auth
 }
 
 type Service struct {
 	repo               store.Repository
 	secrets            store.SecretStore
-	providers          map[string]provider.CloudProvider
+	providers          map[string]provider.Provider
 	now                func() time.Time
 	events             chan Event
 	healthCheck        func(context.Context) error
@@ -107,17 +108,22 @@ type Service struct {
 	recoveryBlocked    atomic.Bool
 }
 
+var (
+	_ provider.DNS01Solver     = (*Service)(nil)
+	_ provider.DNS01Reconciler = (*Service)(nil)
+)
+
 func New(repo store.Repository, secrets store.SecretStore) *Service {
 	return &Service{
 		repo:      repo,
 		secrets:   secrets,
-		providers: make(map[string]provider.CloudProvider),
+		providers: make(map[string]provider.Provider),
 		now:       time.Now,
 		events:    make(chan Event, 128),
 	}
 }
 
-func (s *Service) RegisterProvider(name string, value provider.CloudProvider) {
+func (s *Service) RegisterProvider(name string, value provider.Provider) {
 	s.providers[name] = value
 }
 
@@ -175,6 +181,50 @@ func (s *Service) ResolveCredential(ctx context.Context, credentialID string) (p
 		return provider.Auth{}, err
 	}
 	return s.auth(ctx, credential)
+}
+
+// PresentDNS01, CleanupDNS01, and ReconcileDNS01 make Service the provider
+// router used by the ACME engine and crash recovery. Routing is based only on
+// the provider identity bound into Auth; remote zone IDs are not globally
+// unique and must never select a provider implicitly.
+func (s *Service) PresentDNS01(ctx context.Context, auth provider.Auth, zoneID, fqdn, value, jobID string) (string, error) {
+	p, err := s.dns01Provider(auth)
+	if err != nil {
+		return "", err
+	}
+	return p.PresentDNS01(ctx, auth, zoneID, fqdn, value, jobID)
+}
+
+func (s *Service) CleanupDNS01(ctx context.Context, auth provider.Auth, zoneID, recordID string) error {
+	p, err := s.dns01Provider(auth)
+	if err != nil {
+		return err
+	}
+	return p.CleanupDNS01(ctx, auth, zoneID, recordID)
+}
+
+func (s *Service) ReconcileDNS01(ctx context.Context, auth provider.Auth, zoneID, fqdn, valueHash, jobID string) (string, bool, error) {
+	p, err := s.dns01Provider(auth)
+	if err != nil {
+		return "", false, err
+	}
+	reconciler, ok := p.(provider.DNS01Reconciler)
+	if !ok {
+		return "", false, provider.Unsupported(auth.Provider, "DNS-01 reconciliation")
+	}
+	return reconciler.ReconcileDNS01(ctx, auth, zoneID, fqdn, valueHash, jobID)
+}
+
+func (s *Service) dns01Provider(auth provider.Auth) (provider.Provider, error) {
+	providerName := strings.TrimSpace(auth.Provider)
+	if providerName == "" {
+		return nil, errors.New("DNS-01 credential has no provider identity")
+	}
+	p, ok := s.providers[providerName]
+	if !ok {
+		return nil, fmt.Errorf("DNS-01 provider %q is not registered", providerName)
+	}
+	return p, nil
 }
 
 func (s *Service) IssueCertificates(ctx context.Context, request IssueZonesRequest) (IssueZonesResult, error) {
@@ -341,7 +391,7 @@ func (s *Service) AddCloudflareCredential(ctx context.Context, input AddCredenti
 	}
 
 	id := identifier.New("cred")
-	auth := provider.Auth{CredentialID: id, Token: strings.TrimSpace(input.Token), Kind: input.Kind, AccountID: strings.TrimSpace(input.AccountID)}
+	auth := provider.Auth{Provider: domain.ProviderCloudflare, CredentialID: id, Token: strings.TrimSpace(input.Token), Kind: input.Kind, AccountID: strings.TrimSpace(input.AccountID)}
 	verification, err := p.VerifyCredential(ctx, auth)
 	if err != nil {
 		return domain.Credential{}, fmt.Errorf("verify Cloudflare credential: %w", err)
@@ -393,7 +443,7 @@ func (s *Service) AddCloudflareCredential(ctx context.Context, input AddCredenti
 	if len(verification.Accounts) > 0 {
 		links := make([]domain.AccountCredential, 0, len(verification.Accounts))
 		for i := range verification.Accounts {
-			normalizeAccount(&verification.Accounts[i])
+			normalizeAccount(&verification.Accounts[i], domain.ProviderCloudflare)
 			_, known := knownAccounts[verification.Accounts[i].ID]
 			links = append(links, domain.AccountCredential{AccountID: verification.Accounts[i].ID, CredentialID: id, Preferred: !known})
 		}
@@ -567,7 +617,7 @@ func compensateSecretDelete(ctx context.Context, secrets store.SecretStore, refe
 }
 
 func (s *Service) SyncCredential(ctx context.Context, credentialID string) (domain.Job, error) {
-	job := s.startJob(ctx, "cloudflare.sync", credentialID, "Connecting to Cloudflare")
+	job := s.startJob(ctx, "provider.sync", credentialID, "Connecting to provider")
 	fail := func(err error) (domain.Job, error) {
 		job.State = domain.JobFailed
 		job.Error = err.Error()
@@ -586,6 +636,10 @@ func (s *Service) SyncCredential(ctx context.Context, credentialID string) (doma
 	if err != nil {
 		return fail(err)
 	}
+	job.Kind = credential.Provider + ".sync"
+	job.Message = "Connecting to " + credential.Provider
+	job.UpdatedAt = s.now().UTC()
+	_ = s.repo.SaveJob(ctx, job)
 	p, ok := s.providers[credential.Provider]
 	if !ok {
 		return fail(fmt.Errorf("provider %q is not registered", credential.Provider))
@@ -653,13 +707,14 @@ func (s *Service) SyncCredential(ctx context.Context, credentialID string) (doma
 
 	accountByID := make(map[string]domain.RemoteAccount)
 	for _, account := range verification.Accounts {
-		normalizeAccount(&account)
+		normalizeAccount(&account, credential.Provider)
 		accountByID[account.ID] = account
 	}
 	returnedZoneIDs := make(map[string]struct{}, len(zones))
 	newZoneIDs := make(map[string]struct{}, len(zones))
 	for i := range zones {
-		normalizeZone(&zones[i], "")
+		accountProviderID := zones[i].AccountID
+		normalizeZone(&zones[i], credential.Provider, "")
 		key := zones[i].Provider + "\x00" + zones[i].ProviderID
 		returnedZoneIDs[key] = struct{}{}
 		if existing, known := existingZoneByProviderID[key]; known {
@@ -676,10 +731,13 @@ func (s *Service) SyncCredential(ctx context.Context, credentialID string) (doma
 			newZoneIDs[zones[i].ID] = struct{}{}
 		}
 		if _, exists := accountByID[zones[i].AccountID]; !exists {
-			providerID := strings.TrimPrefix(zones[i].AccountID, "cfacct_")
+			providerID := accountProviderID
+			if credential.Provider == domain.ProviderCloudflare {
+				providerID = strings.TrimPrefix(zones[i].AccountID, "cfacct_")
+			}
 			accountByID[zones[i].AccountID] = domain.RemoteAccount{
-				ID: zones[i].AccountID, Provider: domain.ProviderCloudflare,
-				ProviderID: providerID, Name: "Cloudflare account " + shortID(providerID), CreatedAt: s.now().UTC(),
+				ID: zones[i].AccountID, Provider: credential.Provider,
+				ProviderID: providerID, Name: credential.Provider + " account " + shortID(providerID), CreatedAt: s.now().UTC(),
 			}
 		}
 	}
@@ -714,7 +772,7 @@ func (s *Service) SyncCredential(ctx context.Context, credentialID string) (doma
 			if visibilityErr != nil || !visible {
 				continue
 			}
-			normalizeZone(&visibleZone, "")
+			normalizeZone(&visibleZone, candidate.Provider, "")
 			visibleZone.PreferredCredentialID = ""
 			visibleZone.LastSyncedAt = &staleAt
 			existing = visibleZone
@@ -774,7 +832,7 @@ func (s *Service) SyncCredential(ctx context.Context, credentialID string) (doma
 			if listErr == nil {
 				now := s.now().UTC()
 				for i := range records {
-					normalizeRecord(&records[i], zone.ID)
+					normalizeRecord(&records[i], zone.Provider, zone.ID)
 					records[i].LastSyncedAt = &now
 				}
 				listErr = s.repo.ReplaceDNSRecords(groupCtx, zone.ID, records, now)
@@ -842,7 +900,7 @@ func (s *Service) CreateDNSRecord(ctx context.Context, zoneID string, record dom
 		)
 	}
 	s.observeZoneCapability(context.WithoutCancel(ctx), auth.CredentialID, zone.ID, "dns:write")
-	normalizeRecord(&created, zone.ID)
+	normalizeRecord(&created, zone.Provider, zone.ID)
 	s.audit(context.WithoutCancel(ctx), "dns.create", created.ID, nil, created)
 	if _, reconcileErr := s.reconcileDNSZone(ctx, zone, p, auth); reconcileErr != nil {
 		return created, dnsMutationAppliedButUnreconciledError("create", reconcileErr)
@@ -898,7 +956,7 @@ func (s *Service) PatchDNSRecord(ctx context.Context, zoneID, recordID string, d
 	reconcileStructuredRecordData(&desired, remote)
 	desired.Raw = append(json.RawMessage(nil), remote.Raw...)
 	desired.Proxiable = remote.Proxiable
-	normalizeRecord(&remote, zone.ID)
+	normalizeRecord(&remote, zone.Provider, zone.ID)
 	updated, mutationErr := p.PatchDNSRecord(ctx, auth, zone.ProviderID, cached.ProviderID, desired)
 	if mutationErr != nil {
 		if mutationFailureIsDefinitive(mutationErr) {
@@ -909,7 +967,7 @@ func (s *Service) PatchDNSRecord(ctx context.Context, zoneID, recordID string, d
 		)
 	}
 	s.observeZoneCapability(context.WithoutCancel(ctx), auth.CredentialID, zone.ID, "dns:write")
-	normalizeRecord(&updated, zone.ID)
+	normalizeRecord(&updated, zone.Provider, zone.ID)
 	s.audit(context.WithoutCancel(ctx), "dns.patch", updated.ID, remote, updated)
 	if _, reconcileErr := s.reconcileDNSZone(ctx, zone, p, auth); reconcileErr != nil {
 		return updated, dnsMutationAppliedButUnreconciledError("patch", reconcileErr)
@@ -952,7 +1010,7 @@ func (s *Service) DeleteDNSRecord(ctx context.Context, zoneID, recordID string) 
 	if !sameDNSRecordVersion(cached, remote) {
 		return fmt.Errorf("%w: %s", ErrDNSConflict, cached.Name)
 	}
-	normalizeRecord(&remote, zone.ID)
+	normalizeRecord(&remote, zone.Provider, zone.ID)
 	if mutationErr := p.DeleteDNSRecord(ctx, auth, zone.ProviderID, cached.ProviderID); mutationErr != nil {
 		if mutationFailureIsDefinitive(mutationErr) {
 			return mutationErr
@@ -991,7 +1049,7 @@ func (s *Service) ApplyDNSBatch(ctx context.Context, zoneID string, mutations []
 		return DNSBatchResult{}, err
 	}
 	result := DNSBatchResult{Plan: planned.plan}
-	if _, applyErr := planned.cloud.ApplyDNSBatch(ctx, planned.auth, planned.zone.ProviderID, planned.plan.Mutations); applyErr != nil {
+	if _, applyErr := planned.batch.ApplyDNSBatch(ctx, planned.auth, planned.zone.ProviderID, planned.plan.Mutations); applyErr != nil {
 		if mutationFailureIsDefinitive(applyErr) {
 			return result, applyErr
 		}
@@ -1004,7 +1062,7 @@ func (s *Service) ApplyDNSBatch(ctx context.Context, zoneID string, mutations []
 		if refreshErr == nil {
 			now := s.now().UTC()
 			for index := range records {
-				normalizeRecord(&records[index], planned.zone.ID)
+				normalizeRecord(&records[index], planned.zone.Provider, planned.zone.ID)
 				records[index].LastSyncedAt = &now
 			}
 			result.Records = records
@@ -1015,7 +1073,7 @@ func (s *Service) ApplyDNSBatch(ctx context.Context, zoneID string, mutations []
 			}
 		}
 		return result, errors.Join(
-			fmt.Errorf("Cloudflare batch outcome is unknown; synchronize and review before retrying: %w", applyErr),
+			fmt.Errorf("%s DNS batch outcome is unknown; synchronize and review before retrying: %w", planned.zone.Provider, applyErr),
 			refreshErr,
 		)
 	}
@@ -1030,7 +1088,7 @@ func (s *Service) ApplyDNSBatch(ctx context.Context, zoneID string, mutations []
 	}
 	now := s.now().UTC()
 	for index := range records {
-		normalizeRecord(&records[index], planned.zone.ID)
+		normalizeRecord(&records[index], planned.zone.Provider, planned.zone.ID)
 		records[index].LastSyncedAt = &now
 	}
 	result.Records = records
@@ -1056,7 +1114,7 @@ func mutationFailureIsDefinitive(err error) bool {
 // snapshot. It deliberately outlives cancellation of the mutation request, but
 // remains bounded so an interrupted client cannot leave reconciliation running
 // indefinitely.
-func (s *Service) reconcileDNSZone(ctx context.Context, zone domain.Zone, cloud provider.CloudProvider, auth provider.Auth) ([]domain.DNSRecord, error) {
+func (s *Service) reconcileDNSZone(ctx context.Context, zone domain.Zone, cloud provider.Provider, auth provider.Auth) ([]domain.DNSRecord, error) {
 	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dnsMutationReconcileTimeout)
 	defer cancel()
 	records, err := listAllRecords(reconcileCtx, cloud, auth, zone.ProviderID)
@@ -1065,7 +1123,7 @@ func (s *Service) reconcileDNSZone(ctx context.Context, zone domain.Zone, cloud 
 	}
 	now := s.now().UTC()
 	for index := range records {
-		normalizeRecord(&records[index], zone.ID)
+		normalizeRecord(&records[index], zone.Provider, zone.ID)
 		records[index].LastSyncedAt = &now
 	}
 	cacheErr := s.repo.ReplaceDNSRecords(reconcileCtx, zone.ID, records, now)
@@ -1089,7 +1147,7 @@ func (s *Service) dnsMutationOutcomeUnknownError(
 	before, after interface{},
 	mutationErr error,
 	zone domain.Zone,
-	cloud provider.CloudProvider,
+	cloud provider.Provider,
 	auth provider.Auth,
 ) error {
 	s.audit(context.WithoutCancel(ctx), "dns."+action+".outcome_unknown", resourceID, before, after)
@@ -1118,6 +1176,10 @@ func (s *Service) planDNSBatch(ctx context.Context, zoneID string, mutations []d
 	zone, cloud, auth, err := s.dnsZoneProvider(ctx, zoneID)
 	if err != nil {
 		return plannedDNSBatch{}, err
+	}
+	batch, ok := cloud.(provider.DNSBatchService)
+	if !ok {
+		return plannedDNSBatch{}, provider.Unsupported(zone.Provider, "DNS batch")
 	}
 	cachedRecords, err := s.repo.ListDNSRecords(ctx, zone.ID)
 	if err != nil {
@@ -1175,7 +1237,7 @@ func (s *Service) planDNSBatch(ctx context.Context, zoneID string, mutations []d
 				return plannedDNSBatch{}, fmt.Errorf("DNS batch mutation %d: %w: %s", index, ErrDNSConflict, cached.Name)
 			}
 			remoteForPlan := cloneDNSRecord(remote)
-			normalizeRecord(&remoteForPlan, zone.ID)
+			normalizeRecord(&remoteForPlan, zone.Provider, zone.ID)
 			plannedMutation.RecordID = cached.ProviderID
 			plannedMutation.Before = &remoteForPlan
 			if mutation.Kind == domain.MutationDelete {
@@ -1212,7 +1274,7 @@ func (s *Service) planDNSBatch(ctx context.Context, zoneID string, mutations []d
 		}
 		plan.Mutations = append(plan.Mutations, plannedMutation)
 	}
-	return plannedDNSBatch{plan: plan, zone: zone, cloud: cloud, auth: auth}, nil
+	return plannedDNSBatch{plan: plan, zone: zone, cloud: cloud, batch: batch, auth: auth}, nil
 }
 
 func dnsMutationRecordID(mutation domain.DNSMutation) string {
@@ -1293,7 +1355,11 @@ func (s *Service) TLSSettings(ctx context.Context, zoneID string, refresh bool) 
 	if err != nil {
 		return domain.EdgeTLSSettings{}, err
 	}
-	settings, err := p.GetEdgeTLSSettings(ctx, auth, zone.ProviderID)
+	tlsProvider, ok := p.(provider.EdgeTLSService)
+	if !ok {
+		return domain.EdgeTLSSettings{}, provider.Unsupported(zone.Provider, "edge TLS")
+	}
+	settings, err := tlsProvider.GetEdgeTLSSettings(ctx, auth, zone.ProviderID)
 	if err != nil {
 		return domain.EdgeTLSSettings{}, err
 	}
@@ -1313,10 +1379,14 @@ func (s *Service) EdgeCertificates(ctx context.Context, zoneID string) ([]domain
 	if err != nil {
 		return nil, err
 	}
+	tlsProvider, ok := p.(provider.EdgeTLSService)
+	if !ok {
+		return nil, provider.Unsupported(zone.Provider, "edge TLS")
+	}
 	const pageSize = 50
 	values := make([]domain.EdgeCertificate, 0, pageSize)
 	for page := 1; page <= 200; page++ {
-		batch, listErr := p.ListEdgeCertificates(ctx, auth, zone.ProviderID, provider.PageRequest{Page: page, PerPage: pageSize})
+		batch, listErr := tlsProvider.ListEdgeCertificates(ctx, auth, zone.ProviderID, provider.PageRequest{Page: page, PerPage: pageSize})
 		if listErr != nil {
 			return nil, listErr
 		}
@@ -1342,6 +1412,10 @@ func (s *Service) UpdateTLSSettings(ctx context.Context, zoneID string, desired 
 	if err != nil {
 		return domain.EdgeTLSSettings{}, err
 	}
+	tlsProvider, ok := p.(provider.EdgeTLSService)
+	if !ok {
+		return domain.EdgeTLSSettings{}, provider.Unsupported(zone.Provider, "edge TLS")
+	}
 	baseline, err := s.repo.GetTLSSettings(ctx, zone.ID)
 	if err != nil {
 		return domain.EdgeTLSSettings{}, fmt.Errorf("load displayed TLS baseline: %w", err)
@@ -1349,7 +1423,7 @@ func (s *Service) UpdateTLSSettings(ctx context.Context, zoneID string, desired 
 	if desired.LastSyncedAt != nil && baseline.LastSyncedAt != nil && !desired.LastSyncedAt.Equal(*baseline.LastSyncedAt) {
 		return domain.EdgeTLSSettings{}, ErrTLSConflict
 	}
-	before, err := p.GetEdgeTLSSettings(ctx, auth, zone.ProviderID)
+	before, err := tlsProvider.GetEdgeTLSSettings(ctx, auth, zone.ProviderID)
 	if err != nil {
 		return domain.EdgeTLSSettings{}, fmt.Errorf("re-fetch Cloudflare TLS settings: %w", err)
 	}
@@ -1369,7 +1443,7 @@ func (s *Service) UpdateTLSSettings(ctx context.Context, zoneID string, desired 
 		return before, nil
 	}
 	desired.ZoneID = zone.ProviderID
-	updated, updateErr := p.UpdateEdgeTLSSettings(ctx, auth, zone.ProviderID, baseline, desired)
+	updated, updateErr := tlsProvider.UpdateEdgeTLSSettings(ctx, auth, zone.ProviderID, baseline, desired)
 	if updateErr != nil {
 		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
@@ -1380,7 +1454,7 @@ func (s *Service) UpdateTLSSettings(ctx context.Context, zoneID string, desired 
 			saveErr := s.repo.SaveTLSSettings(reconcileCtx, before)
 			return before, errors.Join(updateErr, wrapError("save unchanged TLS settings", saveErr))
 		}
-		effective, refreshErr := p.GetEdgeTLSSettings(reconcileCtx, auth, zone.ProviderID)
+		effective, refreshErr := tlsProvider.GetEdgeTLSSettings(reconcileCtx, auth, zone.ProviderID)
 		if refreshErr != nil {
 			return domain.EdgeTLSSettings{}, errors.Join(
 				ErrTLSMutationOutcomeUnknown,
@@ -1490,6 +1564,10 @@ func (s *Service) ObserveCredentialZoneCapability(ctx context.Context, credentia
 		(capability != "dns:read" && capability != "dns:write" && capability != "tls:read" && capability != "tls:write") {
 		return errors.New("unsupported observed credential capability")
 	}
+	credential, err := s.repo.GetCredential(ctx, credentialID)
+	if err != nil {
+		return err
+	}
 	zone, err := s.repo.GetZone(ctx, zoneReference)
 	if err != nil {
 		zones, listErr := s.repo.ListZones(ctx)
@@ -1498,7 +1576,7 @@ func (s *Service) ObserveCredentialZoneCapability(ctx context.Context, credentia
 		}
 		zone = domain.Zone{}
 		for _, candidate := range zones {
-			if candidate.ProviderID == zoneReference {
+			if candidate.Provider == credential.Provider && candidate.ProviderID == zoneReference {
 				zone = candidate
 				break
 			}
@@ -1506,10 +1584,6 @@ func (s *Service) ObserveCredentialZoneCapability(ctx context.Context, credentia
 		if zone.ID == "" {
 			return fmt.Errorf("zone %q for observed capability was not found", zoneReference)
 		}
-	}
-	credential, err := s.repo.GetCredential(ctx, credentialID)
-	if err != nil {
-		return err
 	}
 	if credential.Provider != zone.Provider {
 		return errors.New("observed capability credential and zone providers differ")
@@ -1537,10 +1611,10 @@ func (s *Service) auth(ctx context.Context, credential domain.Credential) (provi
 	if err != nil {
 		return provider.Auth{}, fmt.Errorf("unlock credential %q: %w", credential.Label, err)
 	}
-	return provider.Auth{CredentialID: credential.ID, Token: string(secret), Kind: credential.Kind, AccountID: credential.AccountHint}, nil
+	return provider.Auth{Provider: credential.Provider, CredentialID: credential.ID, Token: string(secret), Kind: credential.Kind, AccountID: credential.AccountHint}, nil
 }
 
-func (s *Service) zoneProvider(ctx context.Context, zoneID string) (domain.Zone, provider.CloudProvider, provider.Auth, error) {
+func (s *Service) zoneProvider(ctx context.Context, zoneID string) (domain.Zone, provider.Provider, provider.Auth, error) {
 	zone, err := s.repo.GetZone(ctx, zoneID)
 	if err != nil {
 		return domain.Zone{}, nil, provider.Auth{}, err
@@ -1563,7 +1637,7 @@ func (s *Service) zoneProvider(ctx context.Context, zoneID string) (domain.Zone,
 	return zone, p, auth, err
 }
 
-func (s *Service) dnsZoneProvider(ctx context.Context, zoneID string) (domain.Zone, provider.CloudProvider, provider.Auth, error) {
+func (s *Service) dnsZoneProvider(ctx context.Context, zoneID string) (domain.Zone, provider.Provider, provider.Auth, error) {
 	zone, cloud, auth, err := s.zoneProvider(ctx, zoneID)
 	if err != nil {
 		return domain.Zone{}, nil, provider.Auth{}, err
@@ -1695,25 +1769,46 @@ func advancePage(request *provider.PageRequest, nextCursor string, responsePage,
 	return false
 }
 
-func normalizeAccount(account *domain.RemoteAccount) {
-	if account.ProviderID == "" {
-		account.ProviderID = strings.TrimPrefix(account.ID, "cfacct_")
+func normalizeAccount(account *domain.RemoteAccount, providerName string) {
+	if providerName == "" {
+		providerName = account.Provider
 	}
-	account.Provider = domain.ProviderCloudflare
-	account.ID = "cfacct_" + account.ProviderID
+	if account.ProviderID == "" {
+		account.ProviderID = account.ID
+		if providerName == domain.ProviderCloudflare {
+			account.ProviderID = strings.TrimPrefix(account.ProviderID, "cfacct_")
+		}
+	}
+	account.Provider = providerName
+	if providerName == domain.ProviderCloudflare {
+		account.ID = "cfacct_" + account.ProviderID
+	} else {
+		account.ID = stableID("account", providerName, account.ProviderID)
+	}
 	if account.CreatedAt.IsZero() {
 		account.CreatedAt = time.Now().UTC()
 	}
 }
 
-func normalizeZone(zone *domain.Zone, credentialID string) {
-	if zone.ProviderID == "" {
-		zone.ProviderID = strings.TrimPrefix(zone.ID, "cfzone_")
+func normalizeZone(zone *domain.Zone, providerName, credentialID string) {
+	if providerName == "" {
+		providerName = zone.Provider
 	}
-	zone.Provider = domain.ProviderCloudflare
-	zone.ID = "cfzone_" + zone.ProviderID
-	if !strings.HasPrefix(zone.AccountID, "cfacct_") {
-		zone.AccountID = "cfacct_" + zone.AccountID
+	if zone.ProviderID == "" {
+		zone.ProviderID = zone.ID
+		if providerName == domain.ProviderCloudflare {
+			zone.ProviderID = strings.TrimPrefix(zone.ProviderID, "cfzone_")
+		}
+	}
+	zone.Provider = providerName
+	if providerName == domain.ProviderCloudflare {
+		zone.ID = "cfzone_" + zone.ProviderID
+		if !strings.HasPrefix(zone.AccountID, "cfacct_") {
+			zone.AccountID = "cfacct_" + zone.AccountID
+		}
+	} else {
+		zone.ID = stableID("zone", providerName, zone.ProviderID)
+		zone.AccountID = stableID("account", providerName, zone.AccountID)
 	}
 	zone.PreferredCredentialID = credentialID
 	if zone.Status == "" {
@@ -1721,11 +1816,18 @@ func normalizeZone(zone *domain.Zone, credentialID string) {
 	}
 }
 
-func normalizeRecord(record *domain.DNSRecord, zoneID string) {
+func normalizeRecord(record *domain.DNSRecord, providerName, zoneID string) {
 	if record.ProviderID == "" {
-		record.ProviderID = strings.TrimPrefix(record.ID, "cfrecord_")
+		record.ProviderID = record.ID
+		if providerName == domain.ProviderCloudflare {
+			record.ProviderID = strings.TrimPrefix(record.ProviderID, "cfrecord_")
+		}
 	}
-	record.ID = "cfrecord_" + record.ProviderID
+	if providerName == domain.ProviderCloudflare {
+		record.ID = "cfrecord_" + record.ProviderID
+	} else {
+		record.ID = stableID("record", providerName, zoneID, record.ProviderID)
+	}
 	record.ZoneID = zoneID
 	if unicodeName, err := idna.Lookup.ToUnicode(record.Name); err == nil {
 		record.UnicodeName = unicodeName
@@ -1797,7 +1899,7 @@ func validateRecordValue(record *domain.DNSRecord) error {
 		// Empty TXT values are valid and intentionally preserved.
 	}
 	if record.Proxied && record.Type != domain.RecordA && record.Type != domain.RecordAAAA && record.Type != domain.RecordCNAME {
-		return fmt.Errorf("record type %s cannot be Cloudflare proxied", record.Type)
+		return fmt.Errorf("record type %s cannot be proxied by this provider", record.Type)
 	}
 	if record.Priority != nil && record.Type != domain.RecordMX && record.Type != domain.RecordSRV {
 		return fmt.Errorf("record type %s does not use priority", record.Type)
