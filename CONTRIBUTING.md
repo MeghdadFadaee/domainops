@@ -4,7 +4,7 @@ DomainOps manages live DNS and private certificate material. Contributions are w
 
 ## Development setup
 
-Use Go 1.26 or newer.
+Use Go 1.27.3 or newer.
 
 ```bash
 git clone https://github.com/MeghdadFadaee/domainops.git

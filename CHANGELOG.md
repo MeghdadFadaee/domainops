@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Update Go to 1.27.3 and refresh application dependencies to current releases, addressing the vulnerabilities reported by CI.
+- Update GoReleaser, its pinned GitHub Action, vulnerability scanning, and license generation tools.
+
 ## 0.1.0 - 2026-07-13
 
 - Initial DomainOps implementation.

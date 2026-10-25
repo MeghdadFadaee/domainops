@@ -1,7 +1,7 @@
 # DomainOps
 
 [![CI](https://github.com/MeghdadFadaee/domainops/actions/workflows/ci.yml/badge.svg)](https://github.com/MeghdadFadaee/domainops/actions/workflows/ci.yml)
-[![Go version](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)](https://go.dev/)
+[![Go version](https://img.shields.io/badge/Go-1.27.3%2B-00ADD8?logo=go)](https://go.dev/)
 
 DomainOps is a local-first terminal console for managing domains, DNS, Cloudflare TLS, and locally owned ACME certificates. It is designed for operators with many zones across multiple accounts and remains usable over SSH on a minimal Linux server.
 
@@ -33,7 +33,7 @@ The default command opens a full-screen Bubble Tea v2 interface. The same engine
 
 ## Build and start
 
-Go 1.26.5 or newer is required when building from source.
+Go 1.27.3 or newer is required when building from source.
 
 ```bash
 make build

@@ -28,12 +28,11 @@ lint:
 	go vet ./...
 
 vuln:
-	go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+	go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
 licenses:
-	go run github.com/google/go-licenses@v1.6.0 save ./cmd/domainops \
+	go run github.com/google/go-licenses/v2@v2.0.1 save ./cmd/domainops \
 		--ignore github.com/MeghdadFadaee/domainops \
-		--confidence_threshold 0.7 \
 		--save_path THIRD_PARTY_LICENSES \
 		--force
 
